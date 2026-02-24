@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>pdf2anki Web UI</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <main class="page">
+    <section class="hero card">
+      <h1>pdf2anki Web UI</h1>
+      <p>PDFをGeminiで一問一答カード化し、画面上で修正してCSV出力できます。</p>
+    </section>
+
+    <section class="card">
+      <h2>生成設定</h2>
+      <form id="job-form" class="grid">
+        <label>
+          <span>Gemini API Key</span>
+          <input type="password" name="apiKey" placeholder="空欄なら環境変数を使用" />
+        </label>
+        <label>
+          <span>Model</span>
+          <input type="text" name="model" value="gemini-2.5-flash" />
+        </label>
+        <label class="full">
+          <span>PDFファイル</span>
+          <input type="file" name="pdf" accept="application/pdf" required />
+        </label>
+        <label>
+          <span>ページ範囲</span>
+          <input type="text" name="ranges" value="1-10" required />
+        </label>
+        <label>
+          <span>Step</span>
+          <input type="number" name="step" value="1" min="1" />
+        </label>
+        <label>
+          <span>Overlap</span>
+          <input type="number" name="overlap" value="0" min="0" />
+        </label>
+        <label>
+          <span>Min Confidence</span>
+          <input type="number" name="minConfidence" value="0.5" min="0" max="1" step="0.05" />
+        </label>
+        <label>
+          <span>Concurrency</span>
+          <input type="number" name="concurrency" value="4" min="1" />
+        </label>
+        <label>
+          <span>Delay(ms)</span>
+          <input type="number" name="delayMs" value="0" min="0" />
+        </label>
+        <label>
+          <span>Retries</span>
+          <input type="number" name="retries" value="2" min="0" />
+        </label>
+        <label>
+          <span>Thinking Budget</span>
+          <input type="number" name="thinkingBudget" value="0" min="-1" />
+        </label>
+        <label class="full">
+          <span>Front生成指示</span>
+          <input type="text" name="frontPrompt" value="本文の要点から短い質問を作る" />
+        </label>
+        <label class="full">
+          <span>Back生成指示</span>
+          <input type="text" name="backPrompt" value="質問に対する簡潔な答えを1-3文で" />
+        </label>
+        <div class="full actions">
+          <button type="submit" id="start-btn">生成開始</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="card" id="progress-card">
+      <h2>進捗</h2>
+      <div class="progress-row">
+        <div class="bar"><div class="bar-fill" id="bar-fill"></div></div>
+        <div id="progress-text">待機中</div>
+      </div>
+      <div id="status-message" class="status"></div>
+      <div id="active-chunks" class="chips"></div>
+    </section>
+
+    <section class="card" id="result-card" hidden>
+      <div class="result-head">
+        <h2>カード確認・修正</h2>
+        <div class="toolbar">
+          <input type="search" id="search" placeholder="検索（問題・解答・page）" />
+          <label class="inline-check"><input type="checkbox" id="only-issues" /> issueのみ</label>
+          <button type="button" id="add-row">行を追加</button>
+          <button type="button" id="export-csv">CSVエクスポート</button>
+          <button type="button" id="export-json">JSONエクスポート</button>
+        </div>
+      </div>
+      <div id="summary" class="summary"></div>
+      <div class="table-wrap">
+        <table id="cards-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Page</th>
+              <th>Question</th>
+              <th>Answer</th>
+              <th>Confidence</th>
+              <th>Issue</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

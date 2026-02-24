@@ -1,0 +1,3 @@
+dist/
+/pdf2anki-webui
+*.exe
