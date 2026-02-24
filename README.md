@@ -5,6 +5,7 @@ Python非依存で動く、Gemini API公式Go SDKベースの `pdf2anki` Web UI�
 - ライトモード固定
 - スマホ/PCレスポンシブ
 - PDF -> カード生成
+- ページ範囲/step/overlap連動のPDFプレビュー（折りたたみ可）
 - UI上でカード内容の確認・修正
 - CSV（Anki用 `Front;Back`）エクスポート
 
@@ -51,4 +52,4 @@ GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o dist/pdf2anki-w
 - ページ範囲指定・`step/overlap` 分割はPython版に合わせたロジックで実装
 - PDFはGemini Files APIにアップロードして処理
 - 処理後カードはブラウザ内で編集し、編集後データをCSV/JSONでエクスポート可能
-
+- プレビュー描画は `pdf.js`（CDN読込）を使用

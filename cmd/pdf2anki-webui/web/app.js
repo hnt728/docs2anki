@@ -13,9 +13,40 @@ const addRowBtn = document.getElementById('add-row');
 const exportCsvBtn = document.getElementById('export-csv');
 const exportJsonBtn = document.getElementById('export-json');
 
+const pdfInput = form.querySelector('input[name="pdf"]');
+const rangesInput = form.querySelector('input[name="ranges"]');
+const stepInput = form.querySelector('input[name="step"]');
+const overlapInput = form.querySelector('input[name="overlap"]');
+
+const previewCard = document.getElementById('preview-card');
+const previewToggleBtn = document.getElementById('preview-toggle');
+const previewError = document.getElementById('preview-error');
+const previewFrameWrap = document.getElementById('preview-frame-wrap');
+const previewCanvas = document.getElementById('pdf-preview-canvas');
+const previewEmpty = document.getElementById('preview-empty');
+const pagePrevBtn = document.getElementById('page-prev');
+const pageNextBtn = document.getElementById('page-next');
+const pageIndicator = document.getElementById('page-indicator');
+const chunkSummary = document.getElementById('chunk-summary');
+const chunkList = document.getElementById('chunk-list');
+
+const PREVIEW_COLLAPSE_KEY = 'pdf2anki.previewCollapsed';
+const PREVIEW_EMPTY_TEXT = 'PDFを選択するとここにプレビューが表示されます';
+
 let pollTimer = null;
 let currentJobId = '';
 let cards = [];
+
+let previewPdfDoc = null;
+let previewPageCount = 0;
+let previewChunks = [];
+let selectedChunkIndex = -1;
+let previewPage = 1;
+let previewDebounceTimer = null;
+let previewResizeTimer = null;
+let previewRenderToken = 0;
+let previewLoadingToken = 0;
+let previewRenderTask = null;
 
 function setStatus(text) {
   statusMessage.textContent = text || '';
@@ -59,6 +90,515 @@ function normalizeCard(card = {}) {
     confidence: Number.isFinite(Number(card.confidence)) ? Number(card.confidence) : 0,
     issue: Array.isArray(card.issue) ? card.issue.map((x) => String(x)).filter(Boolean) : [],
   };
+}
+
+function parseRangesExpression(expression) {
+  const parts = String(expression || '').split(',').map((v) => v.trim()).filter(Boolean);
+  if (parts.length === 0) {
+    throw new Error('ページ範囲を指定してください');
+  }
+
+  const ranges = [];
+  for (const part of parts) {
+    if (part.includes('-')) {
+      const [left, right] = part.split('-', 2).map((v) => v.trim());
+      const start = Number.parseInt(left, 10);
+      const end = Number.parseInt(right, 10);
+      if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < 1 || end < start) {
+        throw new Error(`範囲指定が不正です: ${part}`);
+      }
+      ranges.push({ start, end });
+      continue;
+    }
+
+    const page = Number.parseInt(part, 10);
+    if (!Number.isInteger(page) || page < 1) {
+      throw new Error(`ページ指定が不正です: ${part}`);
+    }
+    ranges.push({ start: page, end: page });
+  }
+
+  ranges.sort((a, b) => {
+    if (a.start === b.start) {
+      return a.end - b.end;
+    }
+    return a.start - b.start;
+  });
+
+  const merged = [];
+  for (const current of ranges) {
+    const last = merged[merged.length - 1];
+    if (!last) {
+      merged.push({ ...current });
+      continue;
+    }
+    if (current.start <= last.end + 1) {
+      if (current.end > last.end) {
+        last.end = current.end;
+      }
+      continue;
+    }
+    merged.push({ ...current });
+  }
+
+  return merged;
+}
+
+function parseStepOverlap() {
+  const step = Number.parseInt(stepInput.value || '1', 10);
+  const overlap = Number.parseInt(overlapInput.value || '0', 10);
+
+  if (!Number.isInteger(step) || step < 1) {
+    throw new Error('step は1以上で指定してください');
+  }
+  if (!Number.isInteger(overlap) || overlap < 0 || overlap >= step) {
+    throw new Error('overlap は0以上かつ step 未満で指定してください');
+  }
+
+  return { step, overlap };
+}
+
+function computeChunks(ranges, step, overlap) {
+  const chunks = [];
+  const stride = step - overlap;
+
+  ranges.forEach((range) => {
+    let page = range.start;
+    while (page <= range.end) {
+      const end = Math.min(page + step - 1, range.end);
+      chunks.push({ start: page, end });
+      if (end === range.end) {
+        break;
+      }
+      page += stride;
+    }
+  });
+
+  return chunks;
+}
+
+function setPreviewError(message) {
+  const text = String(message || '').trim();
+  if (text === '') {
+    previewError.hidden = true;
+    previewError.textContent = '';
+    return;
+  }
+  previewError.hidden = false;
+  previewError.textContent = text;
+}
+
+function setPreviewCollapsed(collapsed) {
+  previewCard.classList.toggle('collapsed', Boolean(collapsed));
+  previewToggleBtn.setAttribute('aria-expanded', String(!collapsed));
+  try {
+    localStorage.setItem(PREVIEW_COLLAPSE_KEY, collapsed ? '1' : '0');
+  } catch (_) {
+    // ignore
+  }
+}
+
+function setupPreviewCollapsedState() {
+  let collapsed = false;
+  try {
+    collapsed = localStorage.getItem(PREVIEW_COLLAPSE_KEY) === '1';
+  } catch (_) {
+    collapsed = false;
+  }
+  setPreviewCollapsed(collapsed);
+}
+
+function getSelectedChunk() {
+  if (selectedChunkIndex < 0 || selectedChunkIndex >= previewChunks.length) {
+    return null;
+  }
+  return previewChunks[selectedChunkIndex];
+}
+
+function updatePreviewIndicator() {
+  const chunk = getSelectedChunk();
+  if (!previewPdfDoc) {
+    pageIndicator.textContent = 'page -';
+    return;
+  }
+  if (!chunk) {
+    pageIndicator.textContent = `page ${previewPage}/${previewPageCount}`;
+    return;
+  }
+  pageIndicator.textContent = `page ${previewPage}/${previewPageCount} | chunk ${chunk.start}-${chunk.end}`;
+}
+
+function updatePreviewNavButtons() {
+  if (!previewPdfDoc) {
+    pagePrevBtn.disabled = true;
+    pageNextBtn.disabled = true;
+    return;
+  }
+
+  const chunk = getSelectedChunk();
+  let minPage = 1;
+  let maxPage = previewPageCount;
+
+  if (chunk) {
+    minPage = Math.max(1, chunk.start);
+    maxPage = Math.min(previewPageCount, chunk.end);
+  }
+
+  if (minPage > maxPage) {
+    pagePrevBtn.disabled = true;
+    pageNextBtn.disabled = true;
+    return;
+  }
+
+  pagePrevBtn.disabled = previewPage <= minPage;
+  pageNextBtn.disabled = previewPage >= maxPage;
+}
+
+function renderChunkList() {
+  chunkList.innerHTML = '';
+  chunkSummary.textContent = `${previewChunks.length}件`;
+
+  if (previewChunks.length === 0) {
+    const empty = document.createElement('span');
+    empty.className = 'preview-empty-inline';
+    empty.textContent = '範囲とstepの設定後にチャンクを表示します';
+    chunkList.appendChild(empty);
+    return;
+  }
+
+  previewChunks.forEach((chunk, index) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `chunk-btn${index === selectedChunkIndex ? ' active' : ''}`;
+    button.textContent = `${chunk.start}-${chunk.end}`;
+    button.title = `対象ページ ${chunk.start}-${chunk.end}`;
+    button.addEventListener('click', () => {
+      selectedChunkIndex = index;
+      previewPage = chunk.start;
+      renderChunkList();
+      void renderPreviewPage();
+    });
+    chunkList.appendChild(button);
+  });
+}
+
+function clearPreviewCanvas() {
+  const context = previewCanvas.getContext('2d');
+  if (context) {
+    context.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
+  }
+  previewCanvas.width = 0;
+  previewCanvas.height = 0;
+  previewCanvas.style.width = '0px';
+  previewCanvas.style.height = '0px';
+}
+
+async function renderPreviewPage() {
+  const token = ++previewRenderToken;
+
+  if (!previewPdfDoc) {
+    clearPreviewCanvas();
+    updatePreviewIndicator();
+    updatePreviewNavButtons();
+    return;
+  }
+
+  const chunk = getSelectedChunk();
+  let minPage = 1;
+  let maxPage = previewPageCount;
+
+  if (chunk) {
+    minPage = Math.max(1, chunk.start);
+    maxPage = Math.min(previewPageCount, chunk.end);
+    if (minPage > maxPage) {
+      setPreviewError(`チャンク ${chunk.start}-${chunk.end} はPDF総ページ数(${previewPageCount})の範囲外です`);
+      clearPreviewCanvas();
+      updatePreviewIndicator();
+      updatePreviewNavButtons();
+      return;
+    }
+  }
+
+  previewPage = Math.max(minPage, Math.min(maxPage, previewPage));
+
+  try {
+    const page = await previewPdfDoc.getPage(previewPage);
+    if (token !== previewRenderToken) {
+      return;
+    }
+
+    const natural = page.getViewport({ scale: 1 });
+    const availableWidth = Math.max(260, previewFrameWrap.clientWidth - 22);
+    const scale = availableWidth / natural.width;
+    const viewport = page.getViewport({ scale });
+
+    const pixelRatio = window.devicePixelRatio || 1;
+    previewCanvas.width = Math.floor(viewport.width * pixelRatio);
+    previewCanvas.height = Math.floor(viewport.height * pixelRatio);
+    previewCanvas.style.width = `${Math.floor(viewport.width)}px`;
+    previewCanvas.style.height = `${Math.floor(viewport.height)}px`;
+
+    const context = previewCanvas.getContext('2d', { alpha: false });
+    context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+    context.clearRect(0, 0, viewport.width, viewport.height);
+
+    if (previewRenderTask && typeof previewRenderTask.cancel === 'function') {
+      try {
+        previewRenderTask.cancel();
+      } catch (_) {
+        // ignore
+      }
+    }
+
+    previewRenderTask = page.render({
+      canvasContext: context,
+      viewport,
+    });
+
+    await previewRenderTask.promise;
+    if (token !== previewRenderToken) {
+      return;
+    }
+
+    previewFrameWrap.classList.add('has-file');
+    previewEmpty.hidden = true;
+    setPreviewError('');
+  } catch (error) {
+    if (error && error.name === 'RenderingCancelledException') {
+      return;
+    }
+    setPreviewError(`ページ描画に失敗しました: ${error.message || error}`);
+  }
+
+  updatePreviewIndicator();
+  updatePreviewNavButtons();
+}
+
+function refreshChunkPreview() {
+  if (!previewPdfDoc) {
+    previewChunks = [];
+    selectedChunkIndex = -1;
+    previewPage = 1;
+    renderChunkList();
+    clearPreviewCanvas();
+    updatePreviewIndicator();
+    updatePreviewNavButtons();
+    return;
+  }
+
+  try {
+    const ranges = parseRangesExpression(rangesInput.value);
+    const { step, overlap } = parseStepOverlap();
+    const nextChunks = computeChunks(ranges, step, overlap);
+
+    if (nextChunks.length === 0) {
+      throw new Error('対象ページがありません');
+    }
+
+    const previous = previewChunks[selectedChunkIndex];
+    previewChunks = nextChunks;
+
+    if (previous) {
+      const matched = previewChunks.findIndex((chunk) => chunk.start === previous.start && chunk.end === previous.end);
+      selectedChunkIndex = matched >= 0 ? matched : 0;
+    } else {
+      selectedChunkIndex = 0;
+    }
+
+    const selected = getSelectedChunk();
+    if (selected) {
+      if (previewPage < selected.start || previewPage > selected.end) {
+        previewPage = selected.start;
+      }
+    } else {
+      previewPage = 1;
+    }
+
+    setPreviewError('');
+    renderChunkList();
+    void renderPreviewPage();
+  } catch (error) {
+    previewChunks = [];
+    selectedChunkIndex = -1;
+    previewPage = 1;
+    renderChunkList();
+    clearPreviewCanvas();
+    updatePreviewIndicator();
+    updatePreviewNavButtons();
+    setPreviewError(error.message || 'プレビュー計算に失敗しました');
+  }
+}
+
+function schedulePreviewRefresh() {
+  if (previewDebounceTimer) {
+    clearTimeout(previewDebounceTimer);
+  }
+  previewDebounceTimer = setTimeout(() => {
+    previewDebounceTimer = null;
+    refreshChunkPreview();
+  }, 160);
+}
+
+function isPdfJsReady() {
+  return Boolean(window.pdfjsLib && typeof window.pdfjsLib.getDocument === 'function');
+}
+
+function configurePdfJs() {
+  if (!isPdfJsReady()) {
+    return false;
+  }
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  return true;
+}
+
+function resetPreviewFile() {
+  previewLoadingToken += 1;
+  previewRenderToken += 1;
+
+  if (previewRenderTask && typeof previewRenderTask.cancel === 'function') {
+    try {
+      previewRenderTask.cancel();
+    } catch (_) {
+      // ignore
+    }
+  }
+  previewRenderTask = null;
+
+  if (previewPdfDoc && typeof previewPdfDoc.destroy === 'function') {
+    previewPdfDoc.destroy().catch(() => {
+      // ignore
+    });
+  }
+
+  previewPdfDoc = null;
+  previewPageCount = 0;
+  previewChunks = [];
+  selectedChunkIndex = -1;
+  previewPage = 1;
+
+  clearPreviewCanvas();
+  previewFrameWrap.classList.remove('has-file');
+  previewEmpty.hidden = false;
+  previewEmpty.textContent = PREVIEW_EMPTY_TEXT;
+
+  renderChunkList();
+  updatePreviewIndicator();
+  updatePreviewNavButtons();
+  setPreviewError('');
+}
+
+async function handlePreviewFileChange() {
+  const file = pdfInput.files && pdfInput.files[0];
+  if (!file) {
+    resetPreviewFile();
+    return;
+  }
+
+  if (!isPdfJsReady()) {
+    resetPreviewFile();
+    setPreviewError('PDFプレビューライブラリの読み込みに失敗しました。ネットワーク接続を確認してください。');
+    return;
+  }
+
+  const loadingToken = ++previewLoadingToken;
+  previewRenderToken += 1;
+  previewPdfDoc = null;
+  previewPageCount = 0;
+  previewChunks = [];
+  selectedChunkIndex = -1;
+  previewPage = 1;
+  renderChunkList();
+  clearPreviewCanvas();
+
+  previewFrameWrap.classList.remove('has-file');
+  previewEmpty.hidden = false;
+  previewEmpty.textContent = 'PDFを読み込み中...';
+  updatePreviewIndicator();
+  updatePreviewNavButtons();
+  setPreviewError('');
+
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    if (loadingToken !== previewLoadingToken) {
+      return;
+    }
+
+    const loadingTask = window.pdfjsLib.getDocument({ data: bytes });
+    const doc = await loadingTask.promise;
+    if (loadingToken !== previewLoadingToken) {
+      if (typeof doc.destroy === 'function') {
+        doc.destroy().catch(() => {
+          // ignore
+        });
+      }
+      return;
+    }
+
+    if (previewPdfDoc && typeof previewPdfDoc.destroy === 'function') {
+      await previewPdfDoc.destroy();
+    }
+
+    previewPdfDoc = doc;
+    previewPageCount = Number(doc.numPages || 0);
+
+    previewFrameWrap.classList.add('has-file');
+    previewEmpty.hidden = true;
+    previewEmpty.textContent = PREVIEW_EMPTY_TEXT;
+    setPreviewError('');
+
+    refreshChunkPreview();
+  } catch (error) {
+    resetPreviewFile();
+    setPreviewError(`PDF読み込みに失敗しました: ${error.message || error}`);
+  }
+}
+
+function movePreviewPage(delta) {
+  if (!previewPdfDoc || previewChunks.length === 0) {
+    return;
+  }
+
+  const current = getSelectedChunk();
+  if (!current) {
+    return;
+  }
+
+  const minPage = Math.max(1, current.start);
+  const maxPage = Math.min(previewPageCount, current.end);
+  if (minPage > maxPage) {
+    return;
+  }
+
+  let candidate = previewPage + delta;
+
+  if (candidate < minPage) {
+    if (selectedChunkIndex === 0) {
+      candidate = minPage;
+    } else {
+      selectedChunkIndex -= 1;
+      const prevChunk = getSelectedChunk();
+      previewPage = Math.min(previewPageCount, Math.max(1, prevChunk.end));
+      renderChunkList();
+      void renderPreviewPage();
+      return;
+    }
+  }
+
+  if (candidate > maxPage) {
+    if (selectedChunkIndex === previewChunks.length - 1) {
+      candidate = maxPage;
+    } else {
+      selectedChunkIndex += 1;
+      const nextChunk = getSelectedChunk();
+      previewPage = Math.max(1, nextChunk.start);
+      renderChunkList();
+      void renderPreviewPage();
+      return;
+    }
+  }
+
+  previewPage = candidate;
+  void renderPreviewPage();
 }
 
 function renderTable() {
@@ -135,7 +675,7 @@ function updateSummary(extra = '') {
 
 function csvEscape(value) {
   const text = String(value ?? '');
-  if (/[\";\n\r]/.test(text)) {
+  if (/[";\n\r]/.test(text)) {
     return `"${text.replaceAll('"', '""')}"`;
   }
   return text;
@@ -269,5 +809,44 @@ addRowBtn.addEventListener('click', () => {
 exportCsvBtn.addEventListener('click', exportCSV);
 exportJsonBtn.addEventListener('click', exportJSON);
 
+pdfInput.addEventListener('change', () => {
+  void handlePreviewFileChange();
+});
+
+[rangesInput, stepInput, overlapInput].forEach((input) => {
+  input.addEventListener('input', schedulePreviewRefresh);
+  input.addEventListener('change', schedulePreviewRefresh);
+});
+
+previewToggleBtn.addEventListener('click', () => {
+  const collapsed = previewCard.classList.contains('collapsed');
+  setPreviewCollapsed(!collapsed);
+});
+
+pagePrevBtn.addEventListener('click', () => movePreviewPage(-1));
+pageNextBtn.addEventListener('click', () => movePreviewPage(1));
+
+window.addEventListener('resize', () => {
+  if (previewResizeTimer) {
+    clearTimeout(previewResizeTimer);
+  }
+  previewResizeTimer = setTimeout(() => {
+    previewResizeTimer = null;
+    if (previewPdfDoc) {
+      void renderPreviewPage();
+    }
+  }, 140);
+});
+
+window.addEventListener('beforeunload', () => {
+  resetPreviewFile();
+});
+
 setProgress(0, 1);
 updateSummary();
+setupPreviewCollapsedState();
+resetPreviewFile();
+
+if (!configurePdfJs()) {
+  setPreviewError('PDFプレビューライブラリの読み込みに失敗しました。ネットワーク接続を確認してください。');
+}

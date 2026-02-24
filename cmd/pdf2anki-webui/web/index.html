@@ -13,65 +13,98 @@
       <p>PDFをGeminiで一問一答カード化し、画面上で修正してCSV出力できます。</p>
     </section>
 
-    <section class="card">
-      <h2>生成設定</h2>
-      <form id="job-form" class="grid">
-        <label>
-          <span>Gemini API Key</span>
-          <input type="password" name="apiKey" placeholder="空欄なら環境変数を使用" />
-        </label>
-        <label>
-          <span>Model</span>
-          <input type="text" name="model" value="gemini-2.5-flash" />
-        </label>
-        <label class="full">
-          <span>PDFファイル</span>
-          <input type="file" name="pdf" accept="application/pdf" required />
-        </label>
-        <label>
-          <span>ページ範囲</span>
-          <input type="text" name="ranges" value="1-10" required />
-        </label>
-        <label>
-          <span>Step</span>
-          <input type="number" name="step" value="1" min="1" />
-        </label>
-        <label>
-          <span>Overlap</span>
-          <input type="number" name="overlap" value="0" min="0" />
-        </label>
-        <label>
-          <span>Min Confidence</span>
-          <input type="number" name="minConfidence" value="0.5" min="0" max="1" step="0.05" />
-        </label>
-        <label>
-          <span>Concurrency</span>
-          <input type="number" name="concurrency" value="4" min="1" />
-        </label>
-        <label>
-          <span>Delay(ms)</span>
-          <input type="number" name="delayMs" value="0" min="0" />
-        </label>
-        <label>
-          <span>Retries</span>
-          <input type="number" name="retries" value="2" min="0" />
-        </label>
-        <label>
-          <span>Thinking Budget</span>
-          <input type="number" name="thinkingBudget" value="0" min="-1" />
-        </label>
-        <label class="full">
-          <span>Front生成指示</span>
-          <input type="text" name="frontPrompt" value="本文の要点から短い質問を作る" />
-        </label>
-        <label class="full">
-          <span>Back生成指示</span>
-          <input type="text" name="backPrompt" value="質問に対する簡潔な答えを1-3文で" />
-        </label>
-        <div class="full actions">
-          <button type="submit" id="start-btn">生成開始</button>
+    <section class="split-layout">
+      <section class="card">
+        <h2>生成設定</h2>
+        <form id="job-form" class="grid">
+          <label>
+            <span>Gemini API Key</span>
+            <input type="password" name="apiKey" placeholder="空欄なら環境変数を使用" />
+          </label>
+          <label>
+            <span>Model</span>
+            <input type="text" name="model" value="gemini-2.5-flash" />
+          </label>
+          <label class="full">
+            <span>PDFファイル</span>
+            <input type="file" name="pdf" accept="application/pdf" required />
+          </label>
+          <label>
+            <span>ページ範囲</span>
+            <input type="text" name="ranges" value="1-10" required />
+          </label>
+          <label>
+            <span>Step</span>
+            <input type="number" name="step" value="1" min="1" />
+          </label>
+          <label>
+            <span>Overlap</span>
+            <input type="number" name="overlap" value="0" min="0" />
+          </label>
+          <label>
+            <span>Min Confidence</span>
+            <input type="number" name="minConfidence" value="0.5" min="0" max="1" step="0.05" />
+          </label>
+          <label>
+            <span>Concurrency</span>
+            <input type="number" name="concurrency" value="4" min="1" />
+          </label>
+          <label>
+            <span>Delay(ms)</span>
+            <input type="number" name="delayMs" value="0" min="0" />
+          </label>
+          <label>
+            <span>Retries</span>
+            <input type="number" name="retries" value="2" min="0" />
+          </label>
+          <label>
+            <span>Thinking Budget</span>
+            <input type="number" name="thinkingBudget" value="0" min="-1" />
+          </label>
+          <label class="full">
+            <span>Front生成指示</span>
+            <input type="text" name="frontPrompt" value="本文の要点から短い質問を作る" />
+          </label>
+          <label class="full">
+            <span>Back生成指示</span>
+            <input type="text" name="backPrompt" value="質問に対する簡潔な答えを1-3文で" />
+          </label>
+          <div class="full actions">
+            <button type="submit" id="start-btn">生成開始</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="card preview-card" id="preview-card">
+        <div class="preview-head">
+          <h2>PDFプレビュー</h2>
+          <button type="button" id="preview-toggle" class="icon-btn" aria-expanded="true" aria-controls="preview-body" title="プレビューを折りたたむ">
+            <span class="arrow">▾</span>
+          </button>
         </div>
-      </form>
+
+        <div id="preview-body" class="preview-body">
+          <p class="preview-note">ページ範囲 / step / overlap を変更すると、対象チャンクのプレビューが更新されます。</p>
+          <div id="preview-error" class="preview-error" hidden></div>
+
+          <div class="preview-controls">
+            <button type="button" id="page-prev" class="small-btn">← 前へ</button>
+            <span id="page-indicator">page -</span>
+            <button type="button" id="page-next" class="small-btn">次へ →</button>
+          </div>
+
+          <div id="preview-frame-wrap" class="preview-frame-wrap">
+            <canvas id="pdf-preview-canvas"></canvas>
+            <div id="preview-empty" class="preview-empty">PDFを選択するとここにプレビューが表示されます</div>
+          </div>
+
+          <div class="chunk-head">
+            <strong>チャンク一覧</strong>
+            <span id="chunk-summary">0件</span>
+          </div>
+          <div id="chunk-list" class="chunk-list"></div>
+        </div>
+      </section>
     </section>
 
     <section class="card" id="progress-card">
@@ -115,6 +148,7 @@
     </section>
   </main>
 
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js" defer></script>
   <script src="/static/app.js" defer></script>
 </body>
 </html>
