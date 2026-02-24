@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	defaultModel            = "gemini-2.5-flash"
+	defaultModel            = "gemini-3-flash-preview"
 	defaultMaxChunkPDFBytes = int64(19 * 1024 * 1024) // warning threshold
 	optimizedSourceFileName = "source.optimized.pdf"
 )
@@ -788,7 +788,7 @@ func parseProcessOptions(r *http.Request) (processOptions, error) {
 	if err != nil || overlap < 0 || overlap >= step {
 		return opts, fmt.Errorf("overlap は0以上かつ step 未満で指定してください")
 	}
-	concurrency, err := parseIntFormValue(r.FormValue("concurrency"), 4)
+	concurrency, err := parseIntFormValue(r.FormValue("concurrency"), 1)
 	if err != nil || concurrency < 1 {
 		return opts, fmt.Errorf("concurrency は1以上で指定してください")
 	}
@@ -804,7 +804,7 @@ func parseProcessOptions(r *http.Request) (processOptions, error) {
 	if err != nil || budget < -1 {
 		return opts, fmt.Errorf("thinkingBudget は -1 以上で指定してください")
 	}
-	minConfidence, err := parseFloatFormValue(r.FormValue("minConfidence"), 0.5)
+	minConfidence, err := parseFloatFormValue(r.FormValue("minConfidence"), 0.7)
 	if err != nil {
 		return opts, fmt.Errorf("minConfidence の形式が不正です")
 	}
