@@ -298,7 +298,7 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	log.Printf("pdf2anki Web UI listening on http://localhost%s", *addr)
+	log.Printf("docs2anki listening on http://localhost%s", *addr)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
@@ -934,7 +934,7 @@ func iterChunks(ranges []pageRange, step int, overlap int) ([]pageRange, error) 
 func prepareChunkTasks(pdfPath string, spans []pageRange) ([]chunkTask, []string, func(), error) {
 	warnings := make([]string, 0)
 
-	tmpDir, err := os.MkdirTemp("", "pdf2anki-webui-chunks-*")
+	tmpDir, err := os.MkdirTemp("", "docs2anki-webui-chunks-*")
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("チャンク作業ディレクトリ作成に失敗: %w", err)
 	}
@@ -1157,7 +1157,7 @@ func persistUploadedPDF(src io.Reader, filename string) (string, error) {
 	if ext == "" {
 		ext = ".pdf"
 	}
-	tmp, err := os.CreateTemp("", "pdf2anki-webui-*."+strings.TrimPrefix(ext, "."))
+	tmp, err := os.CreateTemp("", "docs2anki-webui-*."+strings.TrimPrefix(ext, "."))
 	if err != nil {
 		return "", fmt.Errorf("一時ファイル作成に失敗: %w", err)
 	}

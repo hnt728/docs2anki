@@ -32,7 +32,7 @@ const pageIndicator = document.getElementById('page-indicator');
 const chunkSummary = document.getElementById('chunk-summary');
 const chunkList = document.getElementById('chunk-list');
 
-const PREVIEW_COLLAPSE_KEY = 'pdf2anki.previewCollapsed';
+const PREVIEW_COLLAPSE_KEY = 'docs2anki.previewCollapsed';
 const PREVIEW_EMPTY_TEXT = 'PDFを選択するとここにプレビューが表示されます';
 
 let pollTimer = null;

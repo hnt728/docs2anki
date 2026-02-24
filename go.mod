@@ -1,4 +1,4 @@
-module pdf2anki/webui
+module docs2anki/webui
 
 go 1.26
 
