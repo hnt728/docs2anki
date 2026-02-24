@@ -23,11 +23,14 @@ import (
 	"sync"
 	"time"
 
+	pdfapi "github.com/pdfcpu/pdfcpu/pkg/api"
 	"google.golang.org/genai"
 )
 
 const (
-	defaultModel = "gemini-2.5-flash"
+	defaultModel            = "gemini-2.5-flash"
+	defaultMaxChunkPDFBytes = int64(19 * 1024 * 1024) // warning threshold
+	optimizedSourceFileName = "source.optimized.pdf"
 )
 
 var (
@@ -105,8 +108,10 @@ func (r pageRange) Label() string {
 }
 
 type chunkTask struct {
-	Index int
-	Range pageRange
+	Index    int
+	Range    pageRange
+	FilePath string
+	FileSize int64
 }
 
 type chunkResult struct {
@@ -190,6 +195,17 @@ func (j *job) markChunkDone(label string) {
 	delete(j.activeSet, label)
 	j.ActiveChunks = sortedActive(j.activeSet)
 	j.CompletedChunks++
+	j.UpdatedAt = time.Now()
+	j.mu.Unlock()
+}
+
+func (j *job) appendWarning(message string) {
+	msg := strings.TrimSpace(message)
+	if msg == "" {
+		return
+	}
+	j.mu.Lock()
+	j.Warnings = append(j.Warnings, msg)
 	j.UpdatedAt = time.Now()
 	j.mu.Unlock()
 }
@@ -406,7 +422,20 @@ func runJob(ctx context.Context, job *job, pdfPath string, displayName string, o
 	if len(spans) == 0 {
 		return fmt.Errorf("対象ページがありません")
 	}
-	job.markRunning(len(spans))
+
+	chunks, prepWarnings, cleanup, err := prepareChunkTasks(pdfPath, spans)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	if len(chunks) == 0 {
+		return fmt.Errorf("対象ページがありません")
+	}
+
+	job.markRunning(len(chunks))
+	for _, msg := range prepWarnings {
+		job.appendWarning(msg)
+	}
 
 	client, err := genai.NewClient(ctx, &genai.ClientConfig{
 		APIKey:  opts.APIKey,
@@ -416,32 +445,16 @@ func runJob(ctx context.Context, job *job, pdfPath string, displayName string, o
 		return fmt.Errorf("Geminiクライアント作成に失敗: %w", err)
 	}
 
-	uploaded, err := client.Files.UploadFromPath(ctx, pdfPath, &genai.UploadFileConfig{
-		MIMEType:    "application/pdf",
-		DisplayName: safeDisplayName(displayName),
-	})
-	if err != nil {
-		return fmt.Errorf("PDFアップロード失敗: %w", err)
-	}
-	defer func() {
-		_, _ = client.Files.Delete(context.Background(), uploaded.Name, nil)
-	}()
-
-	uploaded, err = waitFileReady(ctx, client, uploaded.Name)
-	if err != nil {
-		return err
-	}
-
 	workerCount := opts.Concurrency
-	if workerCount > len(spans) {
-		workerCount = len(spans)
+	if workerCount > len(chunks) {
+		workerCount = len(chunks)
 	}
 	if workerCount < 1 {
 		workerCount = 1
 	}
 
 	tasks := make(chan chunkTask)
-	results := make(chan chunkResult, len(spans))
+	results := make(chan chunkResult, len(chunks))
 	var workers sync.WaitGroup
 
 	for i := 0; i < workerCount; i++ {
@@ -451,7 +464,7 @@ func runJob(ctx context.Context, job *job, pdfPath string, displayName string, o
 			for task := range tasks {
 				label := task.Range.Label()
 				job.markChunkStart(label)
-				cards, runErr := runChunkWithRetry(ctx, client, uploaded.URI, opts, task.Range)
+				cards, runErr := runChunkWithRetry(ctx, client, displayName, opts, task)
 				job.markChunkDone(label)
 				results <- chunkResult{
 					Index: task.Index,
@@ -464,31 +477,37 @@ func runJob(ctx context.Context, job *job, pdfPath string, displayName string, o
 	}
 
 	go func() {
-		for idx, span := range spans {
-			tasks <- chunkTask{Index: idx, Range: span}
+		for _, task := range chunks {
+			tasks <- task
 		}
 		close(tasks)
 		workers.Wait()
 		close(results)
 	}()
 
-	cardsByChunk := make([][]Card, len(spans))
+	cardsByChunk := make([][]Card, len(chunks))
 	failedChunks := make([]string, 0)
-	warnings := make([]string, 0)
+	warnings := append([]string{}, prepWarnings...)
 	failedCount := 0
 
 	for res := range results {
 		if res.Err != nil {
 			failedCount++
 			failedChunks = append(failedChunks, res.Range.Label())
-			warnings = append(warnings, fmt.Sprintf("%s の処理に失敗: %v", res.Range.Label(), res.Err))
+			warning := fmt.Sprintf("%s の処理に失敗: %v", res.Range.Label(), res.Err)
+			warnings = append(warnings, warning)
+			job.appendWarning(warning)
 			continue
 		}
 		cardsByChunk[res.Index] = res.Cards
 	}
 
-	if failedCount == len(spans) {
-		return fmt.Errorf("全チャンクの処理に失敗しました")
+	if failedCount == len(chunks) {
+		detail := summarizeMessages(warnings, 12)
+		if detail == "" {
+			return fmt.Errorf("全チャンクの処理に失敗しました")
+		}
+		return fmt.Errorf("全チャンクの処理に失敗しました。\n%s", detail)
 	}
 
 	allCards := make([]Card, 0)
@@ -511,7 +530,7 @@ func waitFileReady(ctx context.Context, client *genai.Client, fileName string) (
 		case genai.FileStateActive, genai.FileStateUnspecified:
 			return file, nil
 		case genai.FileStateFailed:
-			return nil, fmt.Errorf("Gemini側でPDF処理に失敗しました")
+			return nil, fmt.Errorf("Gemini側でPDF処理に失敗しました: %s", formatFileStatus(file.Error))
 		}
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("アップロード済みファイルの準備待ちがタイムアウトしました")
@@ -524,7 +543,24 @@ func waitFileReady(ctx context.Context, client *genai.Client, fileName string) (
 	}
 }
 
-func runChunkWithRetry(ctx context.Context, client *genai.Client, fileURI string, opts processOptions, span pageRange) ([]Card, error) {
+func runChunkWithRetry(ctx context.Context, client *genai.Client, displayName string, opts processOptions, task chunkTask) ([]Card, error) {
+	uploaded, err := client.Files.UploadFromPath(ctx, task.FilePath, &genai.UploadFileConfig{
+		MIMEType:    "application/pdf",
+		DisplayName: chunkDisplayName(displayName, task.Range),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("チャンクPDFアップロード失敗(%s): %w", task.Range.Label(), err)
+	}
+	defer func() {
+		_, _ = client.Files.Delete(context.Background(), uploaded.Name, nil)
+	}()
+
+	uploaded, err = waitFileReady(ctx, client, uploaded.Name)
+	if err != nil {
+		return nil, fmt.Errorf("チャンクPDF準備待ち失敗(%s): %w", task.Range.Label(), err)
+	}
+
+	totalAttempts := opts.Retries + 1
 	var lastErr error
 	for attempt := 0; attempt <= opts.Retries; attempt++ {
 		if opts.DelayMS > 0 {
@@ -535,11 +571,11 @@ func runChunkWithRetry(ctx context.Context, client *genai.Client, fileURI string
 			}
 		}
 
-		cards, err := runChunkOnce(ctx, client, fileURI, opts, span)
-		if err == nil {
+		cards, runErr := runChunkOnce(ctx, client, uploaded.URI, opts)
+		if runErr == nil {
 			return cards, nil
 		}
-		lastErr = err
+		lastErr = runErr
 		if attempt == opts.Retries {
 			break
 		}
@@ -552,11 +588,14 @@ func runChunkWithRetry(ctx context.Context, client *genai.Client, fileURI string
 		case <-time.After(wait):
 		}
 	}
-	return nil, lastErr
+	if lastErr == nil {
+		lastErr = errors.New("unknown chunk processing error")
+	}
+	return nil, fmt.Errorf("チャンク処理失敗(%s, size=%s, attempts=%d): %w", task.Range.Label(), formatBytes(task.FileSize), totalAttempts, lastErr)
 }
 
-func runChunkOnce(ctx context.Context, client *genai.Client, fileURI string, opts processOptions, span pageRange) ([]Card, error) {
-	prompt := buildPrompt(opts.FrontPrompt, opts.BackPrompt, span)
+func runChunkOnce(ctx context.Context, client *genai.Client, fileURI string, opts processOptions) ([]Card, error) {
+	prompt := buildPrompt(opts.FrontPrompt, opts.BackPrompt)
 	contents := []*genai.Content{{
 		Role: "user",
 		Parts: []*genai.Part{
@@ -650,11 +689,11 @@ func normalizeIssues(v any) []string {
 	return issues
 }
 
-func buildPrompt(frontPrompt, backPrompt string, span pageRange) string {
-	return strings.TrimSpace(fmt.Sprintf(`あなたは与えられたPDFからAnki向け一問一答カードを作成します。
+func buildPrompt(frontPrompt, backPrompt string) string {
+	return strings.TrimSpace(fmt.Sprintf(`あなたは与えられたPDFチャンクからAnki向け一問一答カードを作成します。
 
-今回の対象ページ範囲は %d-%d です。必ずこの範囲の内容だけを使ってください。
-範囲外の内容は無視してください。
+このPDFは事前に対象ページだけを分割したチャンクです。
+このPDFに含まれる内容のみを使い、推測で補完しないでください。
 
 要件:
 - question(front): %s
@@ -665,9 +704,7 @@ func buildPrompt(frontPrompt, backPrompt string, span pageRange) string {
 - question/answer は必要なら null 可
 - confidence は 0.0〜1.0
 - issue は次のみ: %s
-- 対象範囲にQ/A化できる内容が無ければ [] を返す`,
-		span.Start,
-		span.End,
+- チャンク内にQ/A化できる内容が無ければ [] を返す`,
 		frontPrompt,
 		backPrompt,
 		strings.Join(issueCatalog, ", "),
@@ -892,6 +929,227 @@ func iterChunks(ranges []pageRange, step int, overlap int) ([]pageRange, error) 
 		}
 	}
 	return out, nil
+}
+
+func prepareChunkTasks(pdfPath string, spans []pageRange) ([]chunkTask, []string, func(), error) {
+	warnings := make([]string, 0)
+
+	tmpDir, err := os.MkdirTemp("", "pdf2anki-webui-chunks-*")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("チャンク作業ディレクトリ作成に失敗: %w", err)
+	}
+	cleanup := func() {
+		_ = os.RemoveAll(tmpDir)
+	}
+
+	sourcePath := pdfPath
+	optimizedSourcePath := filepath.Join(tmpDir, optimizedSourceFileName)
+	if err := pdfapi.OptimizeFile(pdfPath, optimizedSourcePath, nil); err != nil {
+		warnings = append(warnings, fmt.Sprintf("元PDFの最適化に失敗したため元ファイルを使用します: %v", err))
+	} else {
+		sourcePath = optimizedSourcePath
+	}
+
+	pageCount, err := pdfapi.PageCountFile(sourcePath)
+	if err != nil && sourcePath != pdfPath {
+		warnings = append(warnings, fmt.Sprintf("最適化PDFのページ数取得に失敗したため元PDFにフォールバックします: %v", err))
+		sourcePath = pdfPath
+		pageCount, err = pdfapi.PageCountFile(sourcePath)
+	}
+	if err != nil {
+		cleanup()
+		return nil, nil, nil, fmt.Errorf("PDFページ数の取得に失敗: %w", err)
+	}
+	if pageCount < 1 {
+		cleanup()
+		return nil, nil, nil, fmt.Errorf("PDFページ数が不正です")
+	}
+
+	validSpans, spanWarnings := clampSpansToPageCount(spans, pageCount)
+	warnings = append(warnings, spanWarnings...)
+	if len(validSpans) == 0 {
+		cleanup()
+		return nil, nil, nil, fmt.Errorf("指定範囲がPDFページ数(%d)の範囲外です", pageCount)
+	}
+
+	preparer := &chunkPreparer{
+		sourcePath: sourcePath,
+		tmpDir:     tmpDir,
+		maxBytes:   defaultMaxChunkPDFBytes,
+		warnings:   &warnings,
+	}
+
+	tasks := make([]chunkTask, 0, len(validSpans))
+	for _, span := range validSpans {
+		built, buildErr := preparer.build(span)
+		if buildErr != nil {
+			cleanup()
+			return nil, nil, nil, buildErr
+		}
+		tasks = append(tasks, built...)
+	}
+	for i := range tasks {
+		tasks[i].Index = i
+	}
+	return tasks, warnings, cleanup, nil
+}
+
+type chunkPreparer struct {
+	sourcePath string
+	tmpDir     string
+	maxBytes   int64
+	warnings   *[]string
+	seq        int
+}
+
+func (p *chunkPreparer) build(span pageRange) ([]chunkTask, error) {
+	chunkPath, chunkSize, err := p.renderChunk(span)
+	if err != nil {
+		return nil, err
+	}
+
+	if chunkSize > p.maxBytes {
+		*p.warnings = append(*p.warnings,
+			fmt.Sprintf("チャンク %s のPDFサイズ %s は目安 %s を超えています。Gemini API 側でファイルサイズエラーになる可能性があります",
+				span.Label(),
+				formatBytes(chunkSize),
+				formatBytes(p.maxBytes),
+			),
+		)
+	}
+
+	return []chunkTask{{
+		Range:    span,
+		FilePath: chunkPath,
+		FileSize: chunkSize,
+	}}, nil
+}
+
+func (p *chunkPreparer) renderChunk(span pageRange) (string, int64, error) {
+	p.seq++
+	base := fmt.Sprintf("chunk-%05d-%d-%d", p.seq, span.Start, span.End)
+	trimmedPath := filepath.Join(p.tmpDir, base+".trim.pdf")
+	finalPath := filepath.Join(p.tmpDir, base+".pdf")
+	selectedPages := []string{span.Label()}
+
+	if err := pdfapi.TrimFile(p.sourcePath, trimmedPath, selectedPages, nil); err != nil {
+		return "", 0, fmt.Errorf("チャンク %s の抽出に失敗: %w", span.Label(), err)
+	}
+
+	if err := pdfapi.OptimizeFile(trimmedPath, finalPath, nil); err != nil {
+		*p.warnings = append(*p.warnings, fmt.Sprintf("チャンク %s の最適化に失敗したため未最適化PDFを使用します: %v", span.Label(), err))
+		_ = os.Remove(finalPath)
+		if renameErr := os.Rename(trimmedPath, finalPath); renameErr != nil {
+			return "", 0, fmt.Errorf("チャンク %s の保存に失敗: %w", span.Label(), renameErr)
+		}
+	} else {
+		_ = os.Remove(trimmedPath)
+	}
+
+	info, err := os.Stat(finalPath)
+	if err != nil {
+		return "", 0, fmt.Errorf("チャンク %s のファイル情報取得に失敗: %w", span.Label(), err)
+	}
+	if info.Size() <= 0 {
+		return "", 0, fmt.Errorf("チャンク %s が空のPDFとして生成されました", span.Label())
+	}
+	return finalPath, info.Size(), nil
+}
+
+func clampSpansToPageCount(spans []pageRange, pageCount int) ([]pageRange, []string) {
+	warnings := make([]string, 0)
+	out := make([]pageRange, 0, len(spans))
+	for _, span := range spans {
+		if span.Start > pageCount {
+			warnings = append(warnings, fmt.Sprintf("%s はPDFページ数(%d)外のためスキップしました", span.Label(), pageCount))
+			continue
+		}
+		adjusted := span
+		if adjusted.End > pageCount {
+			adjusted.End = pageCount
+			warnings = append(warnings, fmt.Sprintf("%s はPDFページ数(%d)に合わせて %s に調整しました", span.Label(), pageCount, adjusted.Label()))
+		}
+		if adjusted.Start < 1 {
+			adjusted.Start = 1
+		}
+		if adjusted.Start > adjusted.End {
+			warnings = append(warnings, fmt.Sprintf("%s は有効ページが無いためスキップしました", span.Label()))
+			continue
+		}
+		out = append(out, adjusted)
+	}
+	return out, warnings
+}
+
+func chunkDisplayName(displayName string, span pageRange) string {
+	base := strings.TrimSpace(displayName)
+	if base == "" {
+		base = "uploaded"
+	}
+	ext := strings.ToLower(filepath.Ext(base))
+	if ext == ".pdf" {
+		base = strings.TrimSuffix(base, filepath.Ext(base))
+	}
+	return safeDisplayName(fmt.Sprintf("%s-%s.pdf", base, span.Label()))
+}
+
+func formatBytes(size int64) string {
+	if size < 1024 {
+		return fmt.Sprintf("%dB", size)
+	}
+	if size < 1024*1024 {
+		return fmt.Sprintf("%.1fKB", float64(size)/1024.0)
+	}
+	return fmt.Sprintf("%.2fMB", float64(size)/(1024.0*1024.0))
+}
+
+func summarizeMessages(messages []string, limit int) string {
+	if len(messages) == 0 {
+		return ""
+	}
+	if limit < 1 {
+		limit = len(messages)
+	}
+	var b strings.Builder
+	upper := len(messages)
+	if upper > limit {
+		upper = limit
+	}
+	for i := 0; i < upper; i++ {
+		b.WriteString("- ")
+		b.WriteString(strings.TrimSpace(messages[i]))
+		if i != upper-1 {
+			b.WriteString("\n")
+		}
+	}
+	if len(messages) > upper {
+		b.WriteString("\n")
+		b.WriteString(fmt.Sprintf("- ... ほか %d 件", len(messages)-upper))
+	}
+	return b.String()
+}
+
+func formatFileStatus(status *genai.FileStatus) string {
+	if status == nil {
+		return "unknown file error"
+	}
+	parts := make([]string, 0, 3)
+	if status.Code != nil {
+		parts = append(parts, fmt.Sprintf("code=%d", *status.Code))
+	}
+	if msg := strings.TrimSpace(status.Message); msg != "" {
+		parts = append(parts, msg)
+	}
+	if len(status.Details) > 0 {
+		raw, err := json.Marshal(status.Details)
+		if err == nil {
+			parts = append(parts, fmt.Sprintf("details=%s", string(raw)))
+		}
+	}
+	if len(parts) == 0 {
+		return "unknown file error"
+	}
+	return strings.Join(parts, " | ")
 }
 
 func persistUploadedPDF(src io.Reader, filename string) (string, error) {

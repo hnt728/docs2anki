@@ -3,6 +3,8 @@ const startBtn = document.getElementById('start-btn');
 const barFill = document.getElementById('bar-fill');
 const progressText = document.getElementById('progress-text');
 const statusMessage = document.getElementById('status-message');
+const statusDetailBox = document.getElementById('status-detail-box');
+const statusDetail = document.getElementById('status-detail');
 const activeChunks = document.getElementById('active-chunks');
 const resultCard = document.getElementById('result-card');
 const summary = document.getElementById('summary');
@@ -50,6 +52,60 @@ let previewRenderTask = null;
 
 function setStatus(text) {
   statusMessage.textContent = text || '';
+}
+
+function setStatusDetail(text) {
+  const message = String(text || '').trim();
+  if (!message) {
+    statusDetailBox.hidden = true;
+    statusDetail.textContent = '';
+    return;
+  }
+  statusDetailBox.hidden = false;
+  statusDetail.textContent = message;
+}
+
+function formatList(items, limit = 12) {
+  const values = Array.isArray(items) ? items.map((v) => String(v || '').trim()).filter(Boolean) : [];
+  if (values.length === 0) {
+    return '';
+  }
+  const head = values.slice(0, limit).map((v) => `- ${v}`).join('\n');
+  if (values.length <= limit) {
+    return head;
+  }
+  return `${head}\n- ... ほか ${values.length - limit} 件`;
+}
+
+function buildJobDetail(data = {}) {
+  const hasFailed = Array.isArray(data.failedChunks) && data.failedChunks.length > 0;
+  const hasWarnings = Array.isArray(data.warnings) && data.warnings.length > 0;
+  const hasError = Boolean(String(data.error || '').trim());
+  if (!hasFailed && !hasWarnings && !hasError) {
+    return '';
+  }
+
+  const lines = [];
+  if (data.jobId || currentJobId) {
+    lines.push(`job: ${data.jobId || currentJobId}`);
+  }
+  if (data.status) {
+    lines.push(`status: ${data.status}`);
+  }
+  if (Array.isArray(data.failedChunks) && data.failedChunks.length > 0) {
+    lines.push(`failed chunks: ${data.failedChunks.join(', ')}`);
+  }
+  if (data.error) {
+    lines.push('');
+    lines.push('error:');
+    lines.push(String(data.error).trim());
+  }
+  if (Array.isArray(data.warnings) && data.warnings.length > 0) {
+    lines.push('');
+    lines.push('warnings:');
+    lines.push(formatList(data.warnings, 14));
+  }
+  return lines.join('\n').trim();
 }
 
 function setProgress(completed, total) {
@@ -714,7 +770,8 @@ async function pollJob(jobId) {
     const data = await res.json();
 
     if (!res.ok) {
-      throw new Error(data?.error?.message || 'ジョブ取得に失敗しました');
+      const code = data?.error?.code ? `[${data.error.code}] ` : '';
+      throw new Error(`${code}${data?.error?.message || 'ジョブ取得に失敗しました'}`);
     }
 
     const total = data.totalChunks || 0;
@@ -724,12 +781,15 @@ async function pollJob(jobId) {
 
     if (data.status === 'queued') {
       setStatus('ジョブをキューに登録しました...');
+      const detail = buildJobDetail(data);
+      setStatusDetail(detail);
       pollTimer = setTimeout(() => pollJob(jobId), 1000);
       return;
     }
 
     if (data.status === 'running') {
       setStatus('Geminiでカードを生成中です...');
+      setStatusDetail(buildJobDetail(data));
       pollTimer = setTimeout(() => pollJob(jobId), 1200);
       return;
     }
@@ -737,7 +797,8 @@ async function pollJob(jobId) {
     if (data.status === 'failed') {
       stopPolling();
       startBtn.disabled = false;
-      setStatus(`失敗: ${data.error || 'unknown error'}`);
+      setStatus('失敗しました。詳細を確認してください。');
+      setStatusDetail(buildJobDetail(data) || String(data.error || 'unknown error'));
       return;
     }
 
@@ -745,6 +806,7 @@ async function pollJob(jobId) {
       stopPolling();
       startBtn.disabled = false;
       setStatus('完了しました。テーブルで内容を修正できます。');
+      setStatusDetail(buildJobDetail(data));
       cards = Array.isArray(data.cards) ? data.cards.map(normalizeCard) : [];
       resultCard.hidden = false;
       renderTable();
@@ -760,6 +822,7 @@ async function pollJob(jobId) {
     stopPolling();
     startBtn.disabled = false;
     setStatus(`エラー: ${err.message}`);
+    setStatusDetail(String(err.message || err));
   }
 }
 
@@ -774,6 +837,7 @@ form.addEventListener('submit', async (event) => {
   const formData = new FormData(form);
   startBtn.disabled = true;
   setStatus('ジョブ作成中...');
+  setStatusDetail('');
   setProgress(0, 1);
   renderActive([]);
 
@@ -785,7 +849,8 @@ form.addEventListener('submit', async (event) => {
     const data = await res.json();
 
     if (!res.ok) {
-      throw new Error(data?.error?.message || 'ジョブ作成に失敗しました');
+      const code = data?.error?.code ? `[${data.error.code}] ` : '';
+      throw new Error(`${code}${data?.error?.message || 'ジョブ作成に失敗しました'}`);
     }
 
     currentJobId = data.jobId;
@@ -794,6 +859,7 @@ form.addEventListener('submit', async (event) => {
   } catch (err) {
     startBtn.disabled = false;
     setStatus(`エラー: ${err.message}`);
+    setStatusDetail(String(err.message || err));
   }
 });
 
