@@ -76,6 +76,12 @@ label span {
   color: var(--muted);
 }
 
+.label-with-help {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .full {
   grid-column: 1 / -1;
 }
@@ -135,6 +141,30 @@ button:disabled {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+}
+
+.help-btn {
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  border: 1px solid #b7cec1;
+  background: #f6fbf8;
+  color: #2b5d49;
+  padding: 0;
+  font-size: 12px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.help-btn:hover {
+  background: #e9f6ef;
+}
+
+.help-btn:focus-visible {
+  outline: 2px solid #8ddbb8;
+  outline-offset: 1px;
 }
 
 .icon-btn .arrow {

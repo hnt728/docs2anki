@@ -36,6 +36,16 @@ const chunkList = document.getElementById('chunk-list');
 const PREVIEW_COLLAPSE_KEY = 'docs2anki.previewCollapsed';
 const PREVIEW_EMPTY_TEXT = 'ファイルを選択するとここにプレビューが表示されます';
 const IMAGE_PREVIEW_MIME_PREFIX = 'image/';
+const settingHelpTexts = Object.freeze({
+  ranges: 'ページ範囲: 処理対象のページ(または画像番号)です。例: 1-12, 5, 8-10',
+  step: 'Step: ページ範囲のページを分割した、1チャンクに含めるページ数です。例: step=3 なら 1-3, 4-6, 7-9 ...を1チャンク(1まとまり)としてGemini APIで処理します。',
+  overlap: 'Overlap: チャンク同士で重複させるページ数です。0以上かつ Step 未満で指定します。例: step=3, overlap=1 なら 1-3, 3-5, 5-7 ...',
+  minConfidence: 'Min Confidence: この値未満のカードに low_confidence を付けます。値は 0.0 から 1.0 です。',
+  concurrency: 'Concurrency: 同時に処理するチャンク数です。大きいほど速くなる可能性がありますが、API制限や失敗率に影響することがあります。1以上で指定します。',
+  delayMs: 'Delay(ms): 各APIリクエスト前に待つ時間(ミリ秒)です。レート制限が厳しいときに増やします。0以上で指定します。',
+  retries: 'Retries: チャンク処理が失敗したときの再試行回数です。0なら再試行しません。',
+  thinkingBudget: 'Thinking Budget: Geminiの思考予算です。-1 は動的、0以上は予算指定です。モデルやAPIバージョンによって実際の挙動は異なる場合があります。',
+});
 
 let pollTimer = null;
 let currentJobId = '';
@@ -1214,6 +1224,21 @@ exportJsonBtn.addEventListener('click', exportJSON);
 
 sourceInput.addEventListener('change', () => {
   void handlePreviewFileChange();
+});
+
+form.addEventListener('click', (event) => {
+  const helpBtn = event.target.closest('.help-btn');
+  if (!helpBtn || !form.contains(helpBtn)) {
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  const key = String(helpBtn.dataset.helpKey || '').trim();
+  const text = settingHelpTexts[key];
+  if (!text) {
+    return;
+  }
+  window.alert(text);
 });
 
 [rangesInput, stepInput, overlapInput].forEach((input) => {
