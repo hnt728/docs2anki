@@ -15,7 +15,7 @@ const addRowBtn = document.getElementById('add-row');
 const exportCsvBtn = document.getElementById('export-csv');
 const exportJsonBtn = document.getElementById('export-json');
 
-const pdfInput = form.querySelector('input[name="pdf"]');
+const sourceInput = form.querySelector('input[name="source"]');
 const rangesInput = form.querySelector('input[name="ranges"]');
 const stepInput = form.querySelector('input[name="step"]');
 const overlapInput = form.querySelector('input[name="overlap"]');
@@ -25,6 +25,7 @@ const previewToggleBtn = document.getElementById('preview-toggle');
 const previewError = document.getElementById('preview-error');
 const previewFrameWrap = document.getElementById('preview-frame-wrap');
 const previewCanvas = document.getElementById('pdf-preview-canvas');
+const previewImage = document.getElementById('image-preview');
 const previewEmpty = document.getElementById('preview-empty');
 const pagePrevBtn = document.getElementById('page-prev');
 const pageNextBtn = document.getElementById('page-next');
@@ -33,12 +34,14 @@ const chunkSummary = document.getElementById('chunk-summary');
 const chunkList = document.getElementById('chunk-list');
 
 const PREVIEW_COLLAPSE_KEY = 'docs2anki.previewCollapsed';
-const PREVIEW_EMPTY_TEXT = 'PDFを選択するとここにプレビューが表示されます';
+const PREVIEW_EMPTY_TEXT = 'ファイルを選択するとここにプレビューが表示されます';
+const IMAGE_PREVIEW_MIME_PREFIX = 'image/';
 
 let pollTimer = null;
 let currentJobId = '';
 let cards = [];
 
+let previewMode = 'none'; // none | pdf | image
 let previewPdfDoc = null;
 let previewPageCount = 0;
 let previewChunks = [];
@@ -49,6 +52,8 @@ let previewResizeTimer = null;
 let previewRenderToken = 0;
 let previewLoadingToken = 0;
 let previewRenderTask = null;
+let previewImageEntries = [];
+let pdfPreviewReady = false;
 
 function setStatus(text) {
   statusMessage.textContent = text || '';
@@ -233,6 +238,31 @@ function computeChunks(ranges, step, overlap) {
   return chunks;
 }
 
+function normalizePreviewMIME(value) {
+  return String(value || '').trim().toLowerCase().split(';', 1)[0];
+}
+
+function inferMimeFromName(name) {
+  const lowered = String(name || '').trim().toLowerCase();
+  if (lowered.endsWith('.pdf')) return 'application/pdf';
+  if (lowered.endsWith('.png')) return 'image/png';
+  if (lowered.endsWith('.jpg') || lowered.endsWith('.jpeg')) return 'image/jpeg';
+  if (lowered.endsWith('.webp')) return 'image/webp';
+  if (lowered.endsWith('.gif')) return 'image/gif';
+  if (lowered.endsWith('.bmp')) return 'image/bmp';
+  if (lowered.endsWith('.tif') || lowered.endsWith('.tiff')) return 'image/tiff';
+  return '';
+}
+
+function getSourceKind(file) {
+  const mime = normalizePreviewMIME(file?.type || '');
+  const fallback = inferMimeFromName(file?.name || '');
+  const resolved = mime || fallback;
+  if (resolved === 'application/pdf') return 'pdf';
+  if (resolved.startsWith(IMAGE_PREVIEW_MIME_PREFIX)) return 'image';
+  return 'unknown';
+}
+
 function setPreviewError(message) {
   const text = String(message || '').trim();
   if (text === '') {
@@ -273,7 +303,19 @@ function getSelectedChunk() {
 
 function updatePreviewIndicator() {
   const chunk = getSelectedChunk();
-  if (!previewPdfDoc) {
+  if (previewMode === 'image') {
+    if (previewPageCount <= 0) {
+      pageIndicator.textContent = 'image -';
+      return;
+    }
+    if (!chunk) {
+      pageIndicator.textContent = `image ${previewPage}/${previewPageCount}`;
+      return;
+    }
+    pageIndicator.textContent = `image ${previewPage}/${previewPageCount} | chunk ${chunk.start}-${chunk.end}`;
+    return;
+  }
+  if (!previewPdfDoc || previewMode !== 'pdf') {
     pageIndicator.textContent = 'page -';
     return;
   }
@@ -285,7 +327,29 @@ function updatePreviewIndicator() {
 }
 
 function updatePreviewNavButtons() {
-  if (!previewPdfDoc) {
+  if (previewMode === 'image') {
+    if (previewPageCount <= 0) {
+      pagePrevBtn.disabled = true;
+      pageNextBtn.disabled = true;
+      return;
+    }
+    const chunk = getSelectedChunk();
+    let minPage = 1;
+    let maxPage = previewPageCount;
+    if (chunk) {
+      minPage = Math.max(1, chunk.start);
+      maxPage = Math.min(previewPageCount, chunk.end);
+    }
+    if (minPage > maxPage) {
+      pagePrevBtn.disabled = true;
+      pageNextBtn.disabled = true;
+      return;
+    }
+    pagePrevBtn.disabled = previewPage <= minPage;
+    pageNextBtn.disabled = previewPage >= maxPage;
+    return;
+  }
+  if (!previewPdfDoc || previewMode !== 'pdf') {
     pagePrevBtn.disabled = true;
     pageNextBtn.disabled = true;
     return;
@@ -317,7 +381,9 @@ function renderChunkList() {
   if (previewChunks.length === 0) {
     const empty = document.createElement('span');
     empty.className = 'preview-empty-inline';
-    empty.textContent = '範囲とstepの設定後にチャンクを表示します';
+    empty.textContent = previewMode === 'pdf'
+      ? '範囲とstepの設定後にチャンクを表示します'
+      : 'ファイルを選択するとチャンクを表示します';
     chunkList.appendChild(empty);
     return;
   }
@@ -349,10 +415,78 @@ function clearPreviewCanvas() {
   previewCanvas.style.height = '0px';
 }
 
+function clearPreviewImage() {
+  previewImageEntries.forEach((entry) => {
+    if (entry?.url) {
+      URL.revokeObjectURL(entry.url);
+    }
+  });
+  previewImageEntries = [];
+  previewImage.hidden = true;
+  previewImage.removeAttribute('src');
+}
+
+function showPdfPreviewSurface() {
+  previewCanvas.hidden = false;
+  previewImage.hidden = true;
+}
+
+function showImagePreviewSurface() {
+  previewCanvas.hidden = true;
+  previewImage.hidden = false;
+}
+
+async function renderImagePreviewPage() {
+  if (previewMode !== 'image' || previewPageCount <= 0) {
+    updatePreviewIndicator();
+    updatePreviewNavButtons();
+    return;
+  }
+
+  const chunk = getSelectedChunk();
+  let minPage = 1;
+  let maxPage = previewPageCount;
+  if (chunk) {
+    minPage = Math.max(1, chunk.start);
+    maxPage = Math.min(previewPageCount, chunk.end);
+    if (minPage > maxPage) {
+      setPreviewError(`チャンク ${chunk.start}-${chunk.end} は画像枚数(${previewPageCount})の範囲外です`);
+      previewFrameWrap.classList.remove('has-file');
+      previewEmpty.hidden = false;
+      previewEmpty.textContent = '対象画像がありません';
+      updatePreviewIndicator();
+      updatePreviewNavButtons();
+      return;
+    }
+  }
+
+  previewPage = Math.max(minPage, Math.min(maxPage, previewPage));
+  const entry = previewImageEntries[previewPage - 1];
+  if (!entry) {
+    setPreviewError(`画像ページ ${previewPage} の取得に失敗しました`);
+    updatePreviewIndicator();
+    updatePreviewNavButtons();
+    return;
+  }
+
+  showImagePreviewSurface();
+  previewImage.src = entry.url;
+  previewFrameWrap.classList.add('has-file');
+  previewEmpty.hidden = true;
+  setPreviewError('');
+  updatePreviewIndicator();
+  updatePreviewNavButtons();
+}
+
 async function renderPreviewPage() {
   const token = ++previewRenderToken;
 
-  if (!previewPdfDoc) {
+  if (previewMode === 'image') {
+    await renderImagePreviewPage();
+    return;
+  }
+
+  if (!previewPdfDoc || previewMode !== 'pdf') {
     clearPreviewCanvas();
     updatePreviewIndicator();
     updatePreviewNavButtons();
@@ -416,6 +550,7 @@ async function renderPreviewPage() {
       return;
     }
 
+    showPdfPreviewSurface();
     previewFrameWrap.classList.add('has-file');
     previewEmpty.hidden = true;
     setPreviewError('');
@@ -431,7 +566,84 @@ async function renderPreviewPage() {
 }
 
 function refreshChunkPreview() {
-  if (!previewPdfDoc) {
+  if (previewMode === 'image') {
+    if (previewPageCount <= 0) {
+      previewChunks = [];
+      selectedChunkIndex = -1;
+      previewPage = 1;
+      renderChunkList();
+      updatePreviewIndicator();
+      updatePreviewNavButtons();
+      return;
+    }
+    try {
+      const ranges = parseRangesExpression(rangesInput.value);
+      const { step, overlap } = parseStepOverlap();
+      const nextChunks = computeChunks(ranges, step, overlap);
+      if (nextChunks.length === 0) {
+        throw new Error('対象ページがありません');
+      }
+
+      const clamped = [];
+      let adjustedCount = 0;
+      nextChunks.forEach((chunk) => {
+        if (chunk.start > previewPageCount) {
+          adjustedCount += 1;
+          return;
+        }
+        const adjusted = {
+          start: Math.max(1, chunk.start),
+          end: Math.min(previewPageCount, chunk.end),
+        };
+        if (adjusted.end !== chunk.end) {
+          adjustedCount += 1;
+        }
+        if (adjusted.start <= adjusted.end) {
+          clamped.push(adjusted);
+        }
+      });
+      if (clamped.length === 0) {
+        throw new Error(`指定範囲が画像枚数(${previewPageCount})の範囲外です`);
+      }
+
+      const previous = previewChunks[selectedChunkIndex];
+      previewChunks = clamped;
+      if (previous) {
+        const matched = previewChunks.findIndex((chunk) => chunk.start === previous.start && chunk.end === previous.end);
+        selectedChunkIndex = matched >= 0 ? matched : 0;
+      } else {
+        selectedChunkIndex = 0;
+      }
+
+      const selected = getSelectedChunk();
+      if (selected) {
+        if (previewPage < selected.start || previewPage > selected.end) {
+          previewPage = selected.start;
+        }
+      } else {
+        previewPage = 1;
+      }
+
+      renderChunkList();
+      void renderPreviewPage();
+      if (adjustedCount > 0) {
+        setPreviewError(`指定範囲の一部を画像枚数(${previewPageCount})に合わせて調整しました`);
+      } else {
+        setPreviewError('');
+      }
+    } catch (error) {
+      previewChunks = [];
+      selectedChunkIndex = -1;
+      previewPage = 1;
+      renderChunkList();
+      updatePreviewIndicator();
+      updatePreviewNavButtons();
+      setPreviewError(error.message || 'プレビュー計算に失敗しました');
+    }
+    return;
+  }
+
+  if (!previewPdfDoc || previewMode !== 'pdf') {
     previewChunks = [];
     selectedChunkIndex = -1;
     previewPage = 1;
@@ -507,6 +719,24 @@ function configurePdfJs() {
   return true;
 }
 
+function loadImagePreviewElement(url) {
+  return new Promise((resolve, reject) => {
+    const onLoad = () => {
+      previewImage.removeEventListener('load', onLoad);
+      previewImage.removeEventListener('error', onError);
+      resolve();
+    };
+    const onError = () => {
+      previewImage.removeEventListener('load', onLoad);
+      previewImage.removeEventListener('error', onError);
+      reject(new Error('画像の読み込みに失敗しました'));
+    };
+    previewImage.addEventListener('load', onLoad);
+    previewImage.addEventListener('error', onError);
+    previewImage.src = url;
+  });
+}
+
 function resetPreviewFile() {
   previewLoadingToken += 1;
   previewRenderToken += 1;
@@ -526,12 +756,15 @@ function resetPreviewFile() {
     });
   }
 
+  previewMode = 'none';
   previewPdfDoc = null;
   previewPageCount = 0;
   previewChunks = [];
   selectedChunkIndex = -1;
   previewPage = 1;
 
+  clearPreviewImage();
+  showPdfPreviewSurface();
   clearPreviewCanvas();
   previewFrameWrap.classList.remove('has-file');
   previewEmpty.hidden = false;
@@ -544,37 +777,115 @@ function resetPreviewFile() {
 }
 
 async function handlePreviewFileChange() {
-  const file = pdfInput.files && pdfInput.files[0];
-  if (!file) {
+  const files = Array.from(sourceInput.files || []);
+  if (files.length === 0) {
     resetPreviewFile();
     return;
   }
 
-  if (!isPdfJsReady()) {
+  const sourceKinds = files.map((file) => getSourceKind(file));
+  if (sourceKinds.some((kind) => kind === 'unknown')) {
     resetPreviewFile();
-    setPreviewError('PDFプレビューライブラリの読み込みに失敗しました。ネットワーク接続を確認してください。');
+    setPreviewError('対応形式は PDF または画像(PNG/JPEG/WEBP/GIF/BMP/TIFF)です。');
+    return;
+  }
+  const uniqueKinds = [...new Set(sourceKinds)];
+  if (uniqueKinds.length !== 1) {
+    resetPreviewFile();
+    setPreviewError('PDFと画像を同時に選択できません。どちらか一方のみ選択してください。');
+    return;
+  }
+  const sourceKind = uniqueKinds[0];
+  if (sourceKind === 'pdf' && files.length > 1) {
+    resetPreviewFile();
+    setPreviewError('PDFは1ファイルのみ選択してください。');
     return;
   }
 
   const loadingToken = ++previewLoadingToken;
   previewRenderToken += 1;
+  previewMode = sourceKind;
+
+  if (previewRenderTask && typeof previewRenderTask.cancel === 'function') {
+    try {
+      previewRenderTask.cancel();
+    } catch (_) {
+      // ignore
+    }
+  }
+  previewRenderTask = null;
+  clearPreviewImage();
+  clearPreviewCanvas();
+  previewFrameWrap.classList.remove('has-file');
+  previewEmpty.hidden = false;
+  setPreviewError('');
+
+  if (sourceKind === 'image') {
+    if (previewPdfDoc && typeof previewPdfDoc.destroy === 'function') {
+      previewPdfDoc.destroy().catch(() => {
+        // ignore
+      });
+    }
+    previewPdfDoc = null;
+    previewImageEntries = files.map((file, index) => ({
+      file,
+      page: index + 1,
+      url: URL.createObjectURL(file),
+    }));
+    previewPageCount = previewImageEntries.length;
+    previewChunks = [];
+    selectedChunkIndex = -1;
+    previewPage = 1;
+
+    previewEmpty.textContent = `${previewPageCount}枚の画像を読み込み中...`;
+    renderChunkList();
+    updatePreviewIndicator();
+    updatePreviewNavButtons();
+
+    try {
+      const first = previewImageEntries[0];
+      if (!first) {
+        throw new Error('画像が見つかりません');
+      }
+      await loadImagePreviewElement(first.url);
+      if (loadingToken !== previewLoadingToken) {
+        return;
+      }
+      showImagePreviewSurface();
+      previewFrameWrap.classList.add('has-file');
+      previewEmpty.hidden = true;
+      previewEmpty.textContent = PREVIEW_EMPTY_TEXT;
+      setPreviewError('');
+      refreshChunkPreview();
+    } catch (error) {
+      if (loadingToken !== previewLoadingToken) {
+        return;
+      }
+      resetPreviewFile();
+      setPreviewError(`画像読み込みに失敗しました: ${error.message || error}`);
+    }
+    return;
+  }
+
+  if (!pdfPreviewReady) {
+    resetPreviewFile();
+    setPreviewError('PDFプレビューライブラリの読み込みに失敗しました。ネットワーク接続を確認してください。');
+    return;
+  }
+
   previewPdfDoc = null;
   previewPageCount = 0;
   previewChunks = [];
   selectedChunkIndex = -1;
   previewPage = 1;
   renderChunkList();
-  clearPreviewCanvas();
-
-  previewFrameWrap.classList.remove('has-file');
-  previewEmpty.hidden = false;
+  showPdfPreviewSurface();
   previewEmpty.textContent = 'PDFを読み込み中...';
   updatePreviewIndicator();
   updatePreviewNavButtons();
-  setPreviewError('');
 
   try {
-    const bytes = new Uint8Array(await file.arrayBuffer());
+    const bytes = new Uint8Array(await files[0].arrayBuffer());
     if (loadingToken !== previewLoadingToken) {
       return;
     }
@@ -596,6 +907,7 @@ async function handlePreviewFileChange() {
 
     previewPdfDoc = doc;
     previewPageCount = Number(doc.numPages || 0);
+    previewMode = 'pdf';
 
     previewFrameWrap.classList.add('has-file');
     previewEmpty.hidden = true;
@@ -604,13 +916,25 @@ async function handlePreviewFileChange() {
 
     refreshChunkPreview();
   } catch (error) {
+    if (loadingToken !== previewLoadingToken) {
+      return;
+    }
     resetPreviewFile();
     setPreviewError(`PDF読み込みに失敗しました: ${error.message || error}`);
   }
 }
 
 function movePreviewPage(delta) {
-  if (!previewPdfDoc || previewChunks.length === 0) {
+  if (previewMode !== 'pdf' && previewMode !== 'image') {
+    return;
+  }
+  if (previewMode === 'pdf' && !previewPdfDoc) {
+    return;
+  }
+  if (previewMode === 'image' && previewPageCount <= 0) {
+    return;
+  }
+  if (previewChunks.length === 0) {
     return;
   }
 
@@ -875,7 +1199,7 @@ addRowBtn.addEventListener('click', () => {
 exportCsvBtn.addEventListener('click', exportCSV);
 exportJsonBtn.addEventListener('click', exportJSON);
 
-pdfInput.addEventListener('change', () => {
+sourceInput.addEventListener('change', () => {
   void handlePreviewFileChange();
 });
 
@@ -898,7 +1222,7 @@ window.addEventListener('resize', () => {
   }
   previewResizeTimer = setTimeout(() => {
     previewResizeTimer = null;
-    if (previewPdfDoc) {
+    if (previewMode === 'pdf' && previewPdfDoc) {
       void renderPreviewPage();
     }
   }, 140);
@@ -913,6 +1237,4 @@ updateSummary();
 setupPreviewCollapsedState();
 resetPreviewFile();
 
-if (!configurePdfJs()) {
-  setPreviewError('PDFプレビューライブラリの読み込みに失敗しました。ネットワーク接続を確認してください。');
-}
+pdfPreviewReady = configurePdfJs();

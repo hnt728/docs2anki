@@ -10,7 +10,7 @@
   <main class="page">
     <section class="hero card">
       <h1>docs2anki</h1>
-      <p>PDFをGeminiで一問一答カード化し、画面上で修正してCSV出力できます。</p>
+      <p>PDF/画像をGeminiで一問一答カード化し、画面上で修正してCSV出力できます。</p>
     </section>
 
     <section class="split-layout">
@@ -26,8 +26,8 @@
             <input type="text" name="model" value="gemini-3-flash-preview" />
           </label>
           <label class="full">
-            <span>PDFファイル</span>
-            <input type="file" name="pdf" accept="application/pdf" required />
+            <span>入力ファイル（PDF / 画像）</span>
+            <input type="file" name="source" accept="application/pdf,image/png,image/jpeg,image/webp,image/gif,image/bmp,image/tiff" multiple required />
           </label>
           <label>
             <span>ページ範囲</span>
@@ -77,14 +77,14 @@
 
       <section class="card preview-card" id="preview-card">
         <div class="preview-head">
-          <h2>PDFプレビュー</h2>
+          <h2>ファイルプレビュー</h2>
           <button type="button" id="preview-toggle" class="icon-btn" aria-expanded="true" aria-controls="preview-body" title="プレビューを折りたたむ">
             <span class="arrow">▾</span>
           </button>
         </div>
 
         <div id="preview-body" class="preview-body">
-          <p class="preview-note">ページ範囲 / step / overlap を変更すると、対象チャンクのプレビューが更新されます。</p>
+          <p class="preview-note">PDF/画像ともにページ範囲 / step / overlap に応じてチャンクプレビューを表示します（画像のページ=画像の並び順）。</p>
           <div id="preview-error" class="preview-error" hidden></div>
 
           <div class="preview-controls">
@@ -95,7 +95,8 @@
 
           <div id="preview-frame-wrap" class="preview-frame-wrap">
             <canvas id="pdf-preview-canvas"></canvas>
-            <div id="preview-empty" class="preview-empty">PDFを選択するとここにプレビューが表示されます</div>
+            <img id="image-preview" alt="画像プレビュー" hidden />
+            <div id="preview-empty" class="preview-empty">ファイルを選択するとここにプレビューが表示されます</div>
           </div>
 
           <div class="chunk-head">

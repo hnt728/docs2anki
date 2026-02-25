@@ -2,13 +2,13 @@
 
 日本語はこちら: [README.ja.md](./README.ja.md)
 
-`docs2anki` converts selected PDF pages into Q&A flashcards with Gemini and lets you review and export the results for Anki.
+`docs2anki` converts uploaded PDF pages or images into Q&A flashcards with Gemini and lets you review and export the results for Anki.
 
 ## Features
 
-- Upload a PDF and generate cards from selected page ranges
+- Upload one PDF or multiple images and generate cards with Gemini
 - Configure chunking with `ranges`, `step`, and `overlap`
-- Preview pages and chunk boundaries before processing
+- Preview pages/chunks for both PDF and image uploads before processing
 - Track job progress, warnings, and failed chunks
 - Review and edit generated cards directly in the browser
 - Export `cards.csv` in `Front;Back` format (no header)
@@ -62,5 +62,6 @@ Or build manually with `GOOS`/`GOARCH`.
 ## Notes
 
 - The UI text is currently in Japanese.
-- PDF preview uses `pdf.js` from a CDN, so preview rendering requires network access.
+- PDF preview uses `pdf.js` from a CDN, so PDF preview rendering requires network access.
+- For image uploads, each image is treated as a page and chunked by `ranges` / `step` / `overlap`.
 - Processing runs as async jobs (`/api/jobs` and `/api/jobs/{jobId}`).

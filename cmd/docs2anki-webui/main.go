@@ -14,6 +14,8 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -31,6 +33,13 @@ const (
 	defaultModel            = "gemini-3-flash-preview"
 	defaultMaxChunkPDFBytes = int64(19 * 1024 * 1024) // warning threshold
 	optimizedSourceFileName = "source.optimized.pdf"
+)
+
+type sourceKind string
+
+const (
+	sourceKindPDF   sourceKind = "pdf"
+	sourceKindImage sourceKind = "image"
 )
 
 var (
@@ -54,6 +63,26 @@ var (
 		"other":                {},
 		"low_confidence":       {},
 	}
+	allowedSourceMIMEs = map[string]sourceKind{
+		"application/pdf": sourceKindPDF,
+		"image/png":       sourceKindImage,
+		"image/jpeg":      sourceKindImage,
+		"image/webp":      sourceKindImage,
+		"image/gif":       sourceKindImage,
+		"image/bmp":       sourceKindImage,
+		"image/tiff":      sourceKindImage,
+	}
+	sourceExtToMIME = map[string]string{
+		".pdf":  "application/pdf",
+		".png":  "image/png",
+		".jpg":  "image/jpeg",
+		".jpeg": "image/jpeg",
+		".webp": "image/webp",
+		".gif":  "image/gif",
+		".bmp":  "image/bmp",
+		".tif":  "image/tiff",
+		".tiff": "image/tiff",
+	}
 )
 
 type app struct {
@@ -76,7 +105,16 @@ type processOptions struct {
 	ThinkingBudget int
 }
 
+type uploadedSource struct {
+	Path        string
+	DisplayName string
+	MIMEType    string
+	Kind        sourceKind
+	Size        int64
+}
+
 type jobConfigSummary struct {
+	SourceType     string  `json:"sourceType"`
 	Model          string  `json:"model"`
 	Ranges         string  `json:"ranges"`
 	Step           int     `json:"step"`
@@ -110,13 +148,22 @@ func (r pageRange) Label() string {
 type chunkTask struct {
 	Index    int
 	Range    pageRange
-	FilePath string
+	Assets   []chunkAsset
 	FileSize int64
+	Kind     sourceKind
+}
+
+type chunkAsset struct {
+	Path        string
+	DisplayName string
+	MIMEType    string
+	Page        int
 }
 
 type chunkResult struct {
 	Index int
 	Range pageRange
+	Label string
 	Cards []Card
 	Err   error
 }
@@ -345,26 +392,29 @@ func (a *app) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		defer r.MultipartForm.RemoveAll()
 	}
 
+	headers, err := parseUploadedSourceHeaders(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "missing_file", "PDFまたは画像ファイルを指定してください")
+		return
+	}
+	sources, err := persistUploadedSources(headers)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "unsupported_file", err.Error())
+		return
+	}
 	opts, err := parseProcessOptions(r)
 	if err != nil {
+		cleanupUploadedSources(sources)
 		writeError(w, http.StatusBadRequest, "invalid_options", err.Error())
 		return
 	}
-
-	file, header, err := r.FormFile("pdf")
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "missing_pdf", "PDFファイルを指定してください")
-		return
-	}
-	defer file.Close()
-
-	tmpPath, err := persistUploadedPDF(file, header.Filename)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "save_failed", err.Error())
-		return
+	sourceType := "unknown"
+	if len(sources) > 0 {
+		sourceType = string(sources[0].Kind)
 	}
 
 	currentJob := a.jobs.create(jobConfigSummary{
+		SourceType:     sourceType,
 		Model:          opts.Model,
 		Ranges:         opts.Ranges,
 		Step:           opts.Step,
@@ -378,16 +428,16 @@ func (a *app) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		ThinkingBudget: opts.ThinkingBudget,
 	})
 
-	go func(j *job, pdfPath string, displayName string, options processOptions) {
-		defer os.Remove(pdfPath)
+	go func(j *job, uploaded []uploadedSource, options processOptions) {
+		defer cleanupUploadedSources(uploaded)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 		defer cancel()
 
-		if err := runJob(ctx, j, pdfPath, displayName, options); err != nil {
+		if err := runJob(ctx, j, uploaded, options); err != nil {
 			j.markFailed(err)
 			log.Printf("job %s failed: %v", j.ID, err)
 		}
-	}(currentJob, tmpPath, header.Filename, opts)
+	}(currentJob, sources, opts)
 
 	writeJSON(w, http.StatusAccepted, map[string]string{"jobId": currentJob.ID})
 }
@@ -410,20 +460,8 @@ func (a *app) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, job.snapshot())
 }
 
-func runJob(ctx context.Context, job *job, pdfPath string, displayName string, opts processOptions) error {
-	ranges, err := parseRanges(opts.Ranges)
-	if err != nil {
-		return err
-	}
-	spans, err := iterChunks(ranges, opts.Step, opts.Overlap)
-	if err != nil {
-		return err
-	}
-	if len(spans) == 0 {
-		return fmt.Errorf("対象ページがありません")
-	}
-
-	chunks, prepWarnings, cleanup, err := prepareChunkTasks(pdfPath, spans)
+func runJob(ctx context.Context, job *job, sources []uploadedSource, opts processOptions) error {
+	chunks, prepWarnings, cleanup, err := buildChunkTasks(sources, opts)
 	if err != nil {
 		return err
 	}
@@ -462,13 +500,14 @@ func runJob(ctx context.Context, job *job, pdfPath string, displayName string, o
 		go func() {
 			defer workers.Done()
 			for task := range tasks {
-				label := task.Range.Label()
+				label := taskLabel(task)
 				job.markChunkStart(label)
-				cards, runErr := runChunkWithRetry(ctx, client, displayName, opts, task)
+				cards, runErr := runChunkWithRetry(ctx, client, opts, task)
 				job.markChunkDone(label)
 				results <- chunkResult{
 					Index: task.Index,
 					Range: task.Range,
+					Label: label,
 					Cards: cards,
 					Err:   runErr,
 				}
@@ -493,8 +532,8 @@ func runJob(ctx context.Context, job *job, pdfPath string, displayName string, o
 	for res := range results {
 		if res.Err != nil {
 			failedCount++
-			failedChunks = append(failedChunks, res.Range.Label())
-			warning := fmt.Sprintf("%s の処理に失敗: %v", res.Range.Label(), res.Err)
+			failedChunks = append(failedChunks, res.Label)
+			warning := fmt.Sprintf("%s の処理に失敗: %v", res.Label, res.Err)
 			warnings = append(warnings, warning)
 			job.appendWarning(warning)
 			continue
@@ -519,6 +558,78 @@ func runJob(ctx context.Context, job *job, pdfPath string, displayName string, o
 	return nil
 }
 
+func buildChunkTasks(sources []uploadedSource, opts processOptions) ([]chunkTask, []string, func(), error) {
+	if len(sources) == 0 {
+		return nil, nil, nil, fmt.Errorf("アップロードファイルがありません")
+	}
+	kind := sources[0].Kind
+	for _, src := range sources[1:] {
+		if src.Kind != kind {
+			return nil, nil, nil, fmt.Errorf("PDFと画像は同時にアップロードできません")
+		}
+	}
+
+	ranges, err := parseRanges(opts.Ranges)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	spans, err := iterChunks(ranges, opts.Step, opts.Overlap)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(spans) == 0 {
+		return nil, nil, nil, fmt.Errorf("対象ページがありません")
+	}
+
+	if kind == sourceKindPDF {
+		if len(sources) != 1 {
+			return nil, nil, nil, fmt.Errorf("PDFは1ファイルのみアップロードできます")
+		}
+		return prepareChunkTasks(sources[0].Path, spans)
+	}
+
+	validSpans, spanWarnings := clampSpansToCount(spans, len(sources), "画像枚数")
+	if len(validSpans) == 0 {
+		return nil, nil, nil, fmt.Errorf("指定範囲が画像枚数(%d)の範囲外です", len(sources))
+	}
+
+	tasks := make([]chunkTask, 0, len(validSpans))
+	for _, span := range validSpans {
+		assets := make([]chunkAsset, 0, span.End-span.Start+1)
+		totalSize := int64(0)
+		for page := span.Start; page <= span.End; page++ {
+			src := sources[page-1]
+			totalSize += src.Size
+			assets = append(assets, chunkAsset{
+				Path:        src.Path,
+				DisplayName: src.DisplayName,
+				MIMEType:    src.MIMEType,
+				Page:        page,
+			})
+		}
+		tasks = append(tasks, chunkTask{
+			Range:    span,
+			Assets:   assets,
+			FileSize: totalSize,
+			Kind:     sourceKindImage,
+		})
+	}
+	for i := range tasks {
+		tasks[i].Index = i
+	}
+	return tasks, spanWarnings, func() {}, nil
+}
+
+func taskLabel(task chunkTask) string {
+	if task.Kind == sourceKindPDF {
+		return task.Range.Label()
+	}
+	if task.Range.Start == task.Range.End {
+		return fmt.Sprintf("img-%d", task.Range.Start)
+	}
+	return fmt.Sprintf("img-%s", task.Range.Label())
+}
+
 func waitFileReady(ctx context.Context, client *genai.Client, fileName string) (*genai.File, error) {
 	deadline := time.Now().Add(5 * time.Minute)
 	for {
@@ -530,7 +641,7 @@ func waitFileReady(ctx context.Context, client *genai.Client, fileName string) (
 		case genai.FileStateActive, genai.FileStateUnspecified:
 			return file, nil
 		case genai.FileStateFailed:
-			return nil, fmt.Errorf("Gemini側でPDF処理に失敗しました: %s", formatFileStatus(file.Error))
+			return nil, fmt.Errorf("Gemini側でファイル処理に失敗しました: %s", formatFileStatus(file.Error))
 		}
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("アップロード済みファイルの準備待ちがタイムアウトしました")
@@ -543,21 +654,44 @@ func waitFileReady(ctx context.Context, client *genai.Client, fileName string) (
 	}
 }
 
-func runChunkWithRetry(ctx context.Context, client *genai.Client, displayName string, opts processOptions, task chunkTask) ([]Card, error) {
-	uploaded, err := client.Files.UploadFromPath(ctx, task.FilePath, &genai.UploadFileConfig{
-		MIMEType:    "application/pdf",
-		DisplayName: chunkDisplayName(displayName, task.Range),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("チャンクPDFアップロード失敗(%s): %w", task.Range.Label(), err)
+type uploadedChunkFile struct {
+	URI      string
+	MIMEType string
+	Page     int
+}
+
+func runChunkWithRetry(ctx context.Context, client *genai.Client, opts processOptions, task chunkTask) ([]Card, error) {
+	if len(task.Assets) == 0 {
+		return nil, fmt.Errorf("チャンクにファイルが含まれていません")
 	}
+
+	uploadedFiles := make([]uploadedChunkFile, 0, len(task.Assets))
+	uploadedNames := make([]string, 0, len(task.Assets))
 	defer func() {
-		_, _ = client.Files.Delete(context.Background(), uploaded.Name, nil)
+		for _, name := range uploadedNames {
+			_, _ = client.Files.Delete(context.Background(), name, nil)
+		}
 	}()
 
-	uploaded, err = waitFileReady(ctx, client, uploaded.Name)
-	if err != nil {
-		return nil, fmt.Errorf("チャンクPDF準備待ち失敗(%s): %w", task.Range.Label(), err)
+	for _, asset := range task.Assets {
+		uploaded, err := client.Files.UploadFromPath(ctx, asset.Path, &genai.UploadFileConfig{
+			MIMEType:    asset.MIMEType,
+			DisplayName: uploadDisplayNameForAsset(task, asset),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("チャンクファイルアップロード失敗(%s): %w", taskLabel(task), err)
+		}
+		uploadedNames = append(uploadedNames, uploaded.Name)
+
+		uploaded, err = waitFileReady(ctx, client, uploaded.Name)
+		if err != nil {
+			return nil, fmt.Errorf("チャンクファイル準備待ち失敗(%s): %w", taskLabel(task), err)
+		}
+		uploadedFiles = append(uploadedFiles, uploadedChunkFile{
+			URI:      uploaded.URI,
+			MIMEType: asset.MIMEType,
+			Page:     asset.Page,
+		})
 	}
 
 	totalAttempts := opts.Retries + 1
@@ -571,7 +705,7 @@ func runChunkWithRetry(ctx context.Context, client *genai.Client, displayName st
 			}
 		}
 
-		cards, runErr := runChunkOnce(ctx, client, uploaded.URI, opts)
+		cards, runErr := runChunkOnce(ctx, client, uploadedFiles, opts, task)
 		if runErr == nil {
 			return cards, nil
 		}
@@ -591,27 +725,34 @@ func runChunkWithRetry(ctx context.Context, client *genai.Client, displayName st
 	if lastErr == nil {
 		lastErr = errors.New("unknown chunk processing error")
 	}
-	return nil, fmt.Errorf("チャンク処理失敗(%s, size=%s, attempts=%d): %w", task.Range.Label(), formatBytes(task.FileSize), totalAttempts, lastErr)
+	return nil, fmt.Errorf("チャンク処理失敗(%s, size=%s, attempts=%d): %w", taskLabel(task), formatBytes(task.FileSize), totalAttempts, lastErr)
 }
 
-func runChunkOnce(ctx context.Context, client *genai.Client, fileURI string, opts processOptions) ([]Card, error) {
-	prompt := buildPrompt(opts.FrontPrompt, opts.BackPrompt)
-	contents := []*genai.Content{{
-		Role: "user",
-		Parts: []*genai.Part{
-			{
-				FileData: &genai.FileData{
-					FileURI:  fileURI,
-					MIMEType: "application/pdf",
-				},
+func runChunkOnce(ctx context.Context, client *genai.Client, files []uploadedChunkFile, opts processOptions, task chunkTask) ([]Card, error) {
+	prompt := buildPrompt(opts.FrontPrompt, opts.BackPrompt, task)
+	parts := make([]*genai.Part, 0, len(files)*2+1)
+	for _, file := range files {
+		if task.Kind == sourceKindImage {
+			parts = append(parts, &genai.Part{Text: fmt.Sprintf("以下は page %d の画像です。", file.Page)})
+		}
+		parts = append(parts, &genai.Part{
+			FileData: &genai.FileData{
+				FileURI:  file.URI,
+				MIMEType: file.MIMEType,
 			},
-			{Text: prompt},
-		},
+		})
+	}
+	parts = append(parts, &genai.Part{Text: prompt})
+
+	contents := []*genai.Content{{
+		Role:  "user",
+		Parts: parts,
 	}}
 
 	cfg := &genai.GenerateContentConfig{
 		ResponseMIMEType:   "application/json",
 		ResponseJsonSchema: buildSchema(),
+		MediaResolution:    genai.MediaResolutionHigh,
 	}
 	if opts.ThinkingBudget >= -1 {
 		budget := int32(opts.ThinkingBudget)
@@ -689,8 +830,9 @@ func normalizeIssues(v any) []string {
 	return issues
 }
 
-func buildPrompt(frontPrompt, backPrompt string) string {
-	return strings.TrimSpace(fmt.Sprintf(`あなたは与えられたPDFチャンクからAnki向け一問一答カードを作成します。
+func buildPrompt(frontPrompt, backPrompt string, task chunkTask) string {
+	if task.Kind == sourceKindPDF {
+		return strings.TrimSpace(fmt.Sprintf(`あなたは与えられたPDFチャンクからAnki向け一問一答カードを作成します。
 
 このPDFは事前に対象ページだけを分割したチャンクです。
 このPDFに含まれる内容のみを使い、推測で補完しないでください。
@@ -705,6 +847,29 @@ func buildPrompt(frontPrompt, backPrompt string) string {
 - confidence は 0.0〜1.0
 - issue は次のみ: %s
 - チャンク内にQ/A化できる内容が無ければ [] を返す`,
+			frontPrompt,
+			backPrompt,
+			strings.Join(issueCatalog, ", "),
+		))
+	}
+
+	return strings.TrimSpace(fmt.Sprintf(`あなたは与えられた画像チャンクからAnki向け一問一答カードを作成します。
+
+このチャンクには page %s の画像が順番に含まれます。
+各画像に付いたページ番号を使い、page には必ず対応する画像番号(1始まり)を入れてください。
+画像に含まれる内容のみを使い、推測で補完しないでください。
+
+要件:
+- question(front): %s
+- answer(back): %s
+- 応答は配列(JSON)のみ
+- 各要素のキーは page, question, answer, confidence, issue
+- page は画像番号(例: "3")
+- question/answer は必要なら null 可
+- confidence は 0.0〜1.0
+- issue は次のみ: %s
+- 画像内にQ/A化できる内容が無ければ [] を返す`,
+		task.Range.Label(),
 		frontPrompt,
 		backPrompt,
 		strings.Join(issueCatalog, ", "),
@@ -719,7 +884,7 @@ func buildSchema() map[string]any {
 			"properties": map[string]any{
 				"page": map[string]any{
 					"type":        "string",
-					"description": "PDFに写っているページ番号。無ければ空文字",
+					"description": "PDFのページ番号または画像番号",
 				},
 				"question": map[string]any{
 					"type":        []string{"string", "null"},
@@ -761,9 +926,6 @@ func parseProcessOptions(r *http.Request) (processOptions, error) {
 	if opts.Model == "" {
 		opts.Model = defaultModel
 	}
-	if opts.Ranges == "" {
-		return opts, fmt.Errorf("ページ範囲を指定してください")
-	}
 	if opts.FrontPrompt == "" {
 		opts.FrontPrompt = "本文の要点から短い質問を作る"
 	}
@@ -780,6 +942,9 @@ func parseProcessOptions(r *http.Request) (processOptions, error) {
 		return opts, fmt.Errorf("Gemini APIキーが未設定です（フォームまたは環境変数）")
 	}
 
+	if opts.Ranges == "" {
+		return opts, fmt.Errorf("ページ範囲を指定してください")
+	}
 	step, err := parseIntFormValue(r.FormValue("step"), 1)
 	if err != nil || step < 1 {
 		return opts, fmt.Errorf("step は1以上で指定してください")
@@ -788,6 +953,9 @@ func parseProcessOptions(r *http.Request) (processOptions, error) {
 	if err != nil || overlap < 0 || overlap >= step {
 		return opts, fmt.Errorf("overlap は0以上かつ step 未満で指定してください")
 	}
+	opts.Step = step
+	opts.Overlap = overlap
+
 	concurrency, err := parseIntFormValue(r.FormValue("concurrency"), 1)
 	if err != nil || concurrency < 1 {
 		return opts, fmt.Errorf("concurrency は1以上で指定してください")
@@ -815,8 +983,6 @@ func parseProcessOptions(r *http.Request) (processOptions, error) {
 		minConfidence = 1
 	}
 
-	opts.Step = step
-	opts.Overlap = overlap
 	opts.Concurrency = concurrency
 	opts.DelayMS = delayMS
 	opts.Retries = retries
@@ -965,7 +1131,7 @@ func prepareChunkTasks(pdfPath string, spans []pageRange) ([]chunkTask, []string
 		return nil, nil, nil, fmt.Errorf("PDFページ数が不正です")
 	}
 
-	validSpans, spanWarnings := clampSpansToPageCount(spans, pageCount)
+	validSpans, spanWarnings := clampSpansToCount(spans, pageCount, "PDFページ数")
 	warnings = append(warnings, spanWarnings...)
 	if len(validSpans) == 0 {
 		cleanup()
@@ -1019,9 +1185,15 @@ func (p *chunkPreparer) build(span pageRange) ([]chunkTask, error) {
 	}
 
 	return []chunkTask{{
-		Range:    span,
-		FilePath: chunkPath,
+		Range: span,
+		Assets: []chunkAsset{{
+			Path:        chunkPath,
+			DisplayName: fmt.Sprintf("chunk-%s.pdf", span.Label()),
+			MIMEType:    "application/pdf",
+			Page:        span.Start,
+		}},
 		FileSize: chunkSize,
+		Kind:     sourceKindPDF,
 	}}, nil
 }
 
@@ -1056,18 +1228,18 @@ func (p *chunkPreparer) renderChunk(span pageRange) (string, int64, error) {
 	return finalPath, info.Size(), nil
 }
 
-func clampSpansToPageCount(spans []pageRange, pageCount int) ([]pageRange, []string) {
+func clampSpansToCount(spans []pageRange, pageCount int, scopeLabel string) ([]pageRange, []string) {
 	warnings := make([]string, 0)
 	out := make([]pageRange, 0, len(spans))
 	for _, span := range spans {
 		if span.Start > pageCount {
-			warnings = append(warnings, fmt.Sprintf("%s はPDFページ数(%d)外のためスキップしました", span.Label(), pageCount))
+			warnings = append(warnings, fmt.Sprintf("%s は%s(%d)外のためスキップしました", span.Label(), scopeLabel, pageCount))
 			continue
 		}
 		adjusted := span
 		if adjusted.End > pageCount {
 			adjusted.End = pageCount
-			warnings = append(warnings, fmt.Sprintf("%s はPDFページ数(%d)に合わせて %s に調整しました", span.Label(), pageCount, adjusted.Label()))
+			warnings = append(warnings, fmt.Sprintf("%s は%s(%d)に合わせて %s に調整しました", span.Label(), scopeLabel, pageCount, adjusted.Label()))
 		}
 		if adjusted.Start < 1 {
 			adjusted.Start = 1
@@ -1081,16 +1253,28 @@ func clampSpansToPageCount(spans []pageRange, pageCount int) ([]pageRange, []str
 	return out, warnings
 }
 
-func chunkDisplayName(displayName string, span pageRange) string {
-	base := strings.TrimSpace(displayName)
-	if base == "" {
-		base = "uploaded"
+func uploadDisplayNameForAsset(task chunkTask, asset chunkAsset) string {
+	name := safeDisplayName(strings.TrimSpace(asset.DisplayName))
+	if name == "uploaded" {
+		if suffix := extensionForMIME(asset.MIMEType); suffix != "" {
+			name += suffix
+		}
 	}
-	ext := strings.ToLower(filepath.Ext(base))
-	if ext == ".pdf" {
-		base = strings.TrimSuffix(base, filepath.Ext(base))
+
+	if task.Kind == sourceKindPDF {
+		base := strings.TrimSuffix(name, filepath.Ext(name))
+		return safeDisplayName(fmt.Sprintf("%s-%s.pdf", base, task.Range.Label()))
 	}
-	return safeDisplayName(fmt.Sprintf("%s-%s.pdf", base, span.Label()))
+	if task.Range.Start == task.Range.End {
+		return name
+	}
+
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	if ext == "" {
+		ext = extensionForMIME(asset.MIMEType)
+	}
+	return safeDisplayName(fmt.Sprintf("%s-p%d%s", base, asset.Page, ext))
 }
 
 func formatBytes(size int64) string {
@@ -1152,10 +1336,192 @@ func formatFileStatus(status *genai.FileStatus) string {
 	return strings.Join(parts, " | ")
 }
 
-func persistUploadedPDF(src io.Reader, filename string) (string, error) {
+func parseUploadedSourceHeaders(r *http.Request) ([]*multipart.FileHeader, error) {
+	if r.MultipartForm == nil {
+		return nil, http.ErrMissingFile
+	}
+	if files := r.MultipartForm.File["source"]; len(files) > 0 {
+		return files, nil
+	}
+	// Backward compatibility for older UI.
+	if files := r.MultipartForm.File["pdf"]; len(files) > 0 {
+		return files, nil
+	}
+	return nil, http.ErrMissingFile
+}
+
+func persistUploadedSources(headers []*multipart.FileHeader) ([]uploadedSource, error) {
+	if len(headers) == 0 {
+		return nil, http.ErrMissingFile
+	}
+	sources := make([]uploadedSource, 0, len(headers))
+	cleanup := func() {
+		cleanupUploadedSources(sources)
+		sources = nil
+	}
+
+	for _, header := range headers {
+		file, err := header.Open()
+		if err != nil {
+			cleanup()
+			return nil, fmt.Errorf("アップロードファイルの読み込みに失敗: %w", err)
+		}
+		tmpPath, err := persistUploadedFile(file, header.Filename)
+		_ = file.Close()
+		if err != nil {
+			cleanup()
+			return nil, err
+		}
+		source, err := buildUploadedSource(tmpPath, header)
+		if err != nil {
+			_ = os.Remove(tmpPath)
+			cleanup()
+			return nil, err
+		}
+		sources = append(sources, source)
+	}
+
+	baseKind := sources[0].Kind
+	for _, src := range sources[1:] {
+		if src.Kind != baseKind {
+			cleanup()
+			return nil, fmt.Errorf("PDFと画像は同時にアップロードできません")
+		}
+	}
+	if baseKind == sourceKindPDF && len(sources) > 1 {
+		cleanup()
+		return nil, fmt.Errorf("PDFは1ファイルのみアップロードできます")
+	}
+	return sources, nil
+}
+
+func cleanupUploadedSources(sources []uploadedSource) {
+	for _, src := range sources {
+		if strings.TrimSpace(src.Path) == "" {
+			continue
+		}
+		_ = os.Remove(src.Path)
+	}
+}
+
+func buildUploadedSource(path string, header *multipart.FileHeader) (uploadedSource, error) {
+	filename := ""
+	contentType := ""
+	if header != nil {
+		filename = strings.TrimSpace(header.Filename)
+		contentType = header.Header.Get("Content-Type")
+	}
+	mimeType, kind, err := detectUploadedSourceType(path, filename, contentType)
+	if err != nil {
+		return uploadedSource{}, err
+	}
+	displayName := safeDisplayName(filename)
+	if displayName == "uploaded" {
+		if ext := extensionForMIME(mimeType); ext != "" {
+			displayName += ext
+		}
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return uploadedSource{}, fmt.Errorf("アップロードファイル情報の取得に失敗: %w", err)
+	}
+	if info.Size() <= 0 {
+		return uploadedSource{}, fmt.Errorf("アップロードファイルが空です")
+	}
+	return uploadedSource{
+		Path:        path,
+		DisplayName: displayName,
+		MIMEType:    mimeType,
+		Kind:        kind,
+		Size:        info.Size(),
+	}, nil
+}
+
+func detectUploadedSourceType(path string, filename string, headerContentType string) (string, sourceKind, error) {
+	candidates := make([]string, 0, 3)
+	if sniffed := detectContentTypeFromFile(path); sniffed != "" {
+		candidates = append(candidates, sniffed)
+	}
+	if fromHeader := normalizeMIME(headerContentType); fromHeader != "" {
+		candidates = append(candidates, fromHeader)
+	}
+	if fromExt, ok := sourceExtToMIME[strings.ToLower(filepath.Ext(filename))]; ok {
+		candidates = append(candidates, fromExt)
+	}
+
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		candidate = normalizeMIME(candidate)
+		if candidate == "" {
+			continue
+		}
+		if _, exists := seen[candidate]; exists {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		if kind, ok := allowedSourceMIMEs[candidate]; ok {
+			return candidate, kind, nil
+		}
+	}
+
+	return "", "", fmt.Errorf("対応形式は PDF または画像(PNG/JPEG/WEBP/GIF/BMP/TIFF)です")
+}
+
+func detectContentTypeFromFile(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	buf := make([]byte, 512)
+	n, err := f.Read(buf)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return ""
+	}
+	if n <= 0 {
+		return ""
+	}
+	return normalizeMIME(http.DetectContentType(buf[:n]))
+}
+
+func normalizeMIME(value string) string {
+	trimmed := strings.ToLower(strings.TrimSpace(value))
+	if trimmed == "" {
+		return ""
+	}
+	mediaType, _, err := mime.ParseMediaType(trimmed)
+	if err != nil {
+		return trimmed
+	}
+	return strings.ToLower(strings.TrimSpace(mediaType))
+}
+
+func extensionForMIME(mimeType string) string {
+	switch normalizeMIME(mimeType) {
+	case "application/pdf":
+		return ".pdf"
+	case "image/png":
+		return ".png"
+	case "image/jpeg":
+		return ".jpg"
+	case "image/webp":
+		return ".webp"
+	case "image/gif":
+		return ".gif"
+	case "image/bmp":
+		return ".bmp"
+	case "image/tiff":
+		return ".tiff"
+	default:
+		return ""
+	}
+}
+
+func persistUploadedFile(src io.Reader, filename string) (string, error) {
 	ext := strings.ToLower(filepath.Ext(filename))
 	if ext == "" {
-		ext = ".pdf"
+		ext = ".bin"
 	}
 	tmp, err := os.CreateTemp("", "docs2anki-webui-*."+strings.TrimPrefix(ext, "."))
 	if err != nil {
@@ -1172,7 +1538,7 @@ func persistUploadedPDF(src io.Reader, filename string) (string, error) {
 func safeDisplayName(name string) string {
 	trimmed := strings.TrimSpace(name)
 	if trimmed == "" {
-		return "uploaded.pdf"
+		return "uploaded"
 	}
 	if len(trimmed) > 180 {
 		trimmed = trimmed[:180]
