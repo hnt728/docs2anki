@@ -238,6 +238,17 @@ function computeChunks(ranges, step, overlap) {
   return chunks;
 }
 
+function rangeExpressionForCount(count) {
+  const total = Number.parseInt(String(count || 0), 10);
+  if (!Number.isInteger(total) || total < 1) {
+    return '';
+  }
+  if (total === 1) {
+    return '1';
+  }
+  return `1-${total}`;
+}
+
 function normalizePreviewMIME(value) {
   return String(value || '').trim().toLowerCase().split(';', 1)[0];
 }
@@ -833,6 +844,7 @@ async function handlePreviewFileChange() {
       url: URL.createObjectURL(file),
     }));
     previewPageCount = previewImageEntries.length;
+    rangesInput.value = rangeExpressionForCount(previewPageCount);
     previewChunks = [];
     selectedChunkIndex = -1;
     previewPage = 1;
@@ -907,6 +919,7 @@ async function handlePreviewFileChange() {
 
     previewPdfDoc = doc;
     previewPageCount = Number(doc.numPages || 0);
+    rangesInput.value = rangeExpressionForCount(previewPageCount);
     previewMode = 'pdf';
 
     previewFrameWrap.classList.add('has-file');
