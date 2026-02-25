@@ -26,7 +26,7 @@ Go is not required when you use release binaries.
 ## Build from source
 
 ```bash
-cd webui
+cd docs2anki
 go mod tidy
 go run ./cmd/docs2anki-webui
 ```
@@ -39,7 +39,7 @@ Source build requirements:
 ## Build a binary
 
 ```bash
-cd webui
+cd docs2anki
 go build -trimpath -ldflags "-s -w" -o dist/docs2anki-webui ./cmd/docs2anki-webui
 ```
 
@@ -48,7 +48,7 @@ go build -trimpath -ldflags "-s -w" -o dist/docs2anki-webui ./cmd/docs2anki-webu
 Use the helper script:
 
 ```bash
-cd webui
+cd docs2anki
 ./build-cross.sh
 ```
 

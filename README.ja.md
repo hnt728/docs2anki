@@ -26,7 +26,7 @@ Releaseバイナリを使う場合、Goは不要です。
 ## ソースから起動
 
 ```bash
-cd webui
+cd docs2anki
 go mod tidy
 go run ./cmd/docs2anki-webui
 ```
@@ -39,7 +39,7 @@ go run ./cmd/docs2anki-webui
 ## ビルド
 
 ```bash
-cd webui
+cd docs2anki
 go build -trimpath -ldflags "-s -w" -o dist/docs2anki-webui ./cmd/docs2anki-webui
 ```
 
@@ -48,7 +48,7 @@ go build -trimpath -ldflags "-s -w" -o dist/docs2anki-webui ./cmd/docs2anki-webu
 補助スクリプトを使う場合:
 
 ```bash
-cd webui
+cd docs2anki
 ./build-cross.sh
 ```
 
