@@ -46,16 +46,8 @@
             <input type="number" name="minConfidence" value="0.7" min="0" max="1" step="0.05" />
           </label>
           <label>
-            <span class="label-with-help">Concurrency <button type="button" class="help-btn" data-help-key="concurrency" aria-label="Concurrencyの説明を表示" title="Concurrencyの説明">?</button></span>
-            <input type="number" name="concurrency" value="1" min="1" />
-          </label>
-          <label>
             <span class="label-with-help">Delay(ms) <button type="button" class="help-btn" data-help-key="delayMs" aria-label="Delayの説明を表示" title="Delayの説明">?</button></span>
             <input type="number" name="delayMs" value="0" min="0" />
-          </label>
-          <label>
-            <span class="label-with-help">Retries <button type="button" class="help-btn" data-help-key="retries" aria-label="Retriesの説明を表示" title="Retriesの説明">?</button></span>
-            <input type="number" name="retries" value="2" min="0" />
           </label>
           <label>
             <span class="label-with-help">Thinking Budget <button type="button" class="help-btn" data-help-key="thinkingBudget" aria-label="Thinking Budgetの説明を表示" title="Thinking Budgetの説明">?</button></span>
@@ -109,17 +101,31 @@
     </section>
 
     <section class="card" id="progress-card">
-      <h2>進捗</h2>
+      <div class="progress-head">
+        <h2>進捗</h2>
+        <button type="button" id="stop-btn" class="danger-btn" hidden>停止</button>
+      </div>
       <div class="progress-row">
         <div class="bar"><div class="bar-fill" id="bar-fill"></div></div>
         <div id="progress-text">待機中</div>
       </div>
       <div id="status-message" class="status"></div>
+      <div id="chunk-action-row" class="chunk-action-row" hidden>
+        <button type="button" id="chunk-retry-btn" class="small-btn">リトライ</button>
+        <button type="button" id="chunk-skip-btn" class="small-btn ghost-btn">スキップ</button>
+      </div>
       <div id="status-detail-box" class="status-detail-box" hidden>
         <div class="status-detail-title">詳細</div>
         <pre id="status-detail" class="status-detail"></pre>
       </div>
       <div id="active-chunks" class="chips"></div>
+      <details id="gemini-console-box" class="console-box">
+        <summary>
+          <span>Gemini Console</span>
+          <span id="gemini-console-count" class="console-count">0行</span>
+        </summary>
+        <pre id="gemini-console" class="console-output"></pre>
+      </details>
     </section>
 
     <section class="card" id="result-card" hidden>

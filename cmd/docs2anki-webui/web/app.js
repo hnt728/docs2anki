@@ -6,6 +6,13 @@ const statusMessage = document.getElementById('status-message');
 const statusDetailBox = document.getElementById('status-detail-box');
 const statusDetail = document.getElementById('status-detail');
 const activeChunks = document.getElementById('active-chunks');
+const stopBtn = document.getElementById('stop-btn');
+const chunkActionRow = document.getElementById('chunk-action-row');
+const chunkRetryBtn = document.getElementById('chunk-retry-btn');
+const chunkSkipBtn = document.getElementById('chunk-skip-btn');
+const geminiConsoleBox = document.getElementById('gemini-console-box');
+const geminiConsole = document.getElementById('gemini-console');
+const geminiConsoleCount = document.getElementById('gemini-console-count');
 const resultCard = document.getElementById('result-card');
 const summary = document.getElementById('summary');
 const tableBody = document.querySelector('#cards-table tbody');
@@ -36,20 +43,21 @@ const chunkList = document.getElementById('chunk-list');
 const PREVIEW_COLLAPSE_KEY = 'docs2anki.previewCollapsed';
 const PREVIEW_EMPTY_TEXT = 'ファイルを選択するとここにプレビューが表示されます';
 const IMAGE_PREVIEW_MIME_PREFIX = 'image/';
+const POLL_ACTIVE_MS = 550;
+const POLL_IDLE_MS = 900;
 const settingHelpTexts = Object.freeze({
   ranges: 'ページ範囲: 処理対象のページ(または画像番号)です。例: 1-12, 5, 8-10',
   step: 'Step: ページ範囲のページを分割した、1チャンクに含めるページ数です。例: step=3 なら 1-3, 4-6, 7-9 ...を1チャンク(1まとまり)としてGemini APIで処理します。',
   overlap: 'Overlap: チャンク同士で重複させるページ数です。0以上かつ Step 未満で指定します。例: step=3, overlap=1 なら 1-3, 3-5, 5-7 ...',
   minConfidence: 'Min Confidence: この値未満のカードに low_confidence を付けます。値は 0.0 から 1.0 です。',
-  concurrency: 'Concurrency: 同時に処理するチャンク数です。大きいほど速くなる可能性がありますが、API制限や失敗率に影響することがあります。1以上で指定します。',
   delayMs: 'Delay(ms): 各APIリクエスト前に待つ時間(ミリ秒)です。レート制限が厳しいときに増やします。0以上で指定します。',
-  retries: 'Retries: チャンク処理が失敗したときの再試行回数です。0なら再試行しません。',
   thinkingBudget: 'Thinking Budget: Geminiの思考予算です。-1 は動的、0以上は予算指定です。モデルやAPIバージョンによって実際の挙動は異なる場合があります。',
 });
 
 let pollTimer = null;
 let currentJobId = '';
 let cards = [];
+let latestLogSeq = 0;
 
 let previewMode = 'none'; // none | pdf | image
 let previewPdfDoc = null;
@@ -80,6 +88,81 @@ function setStatusDetail(text) {
   statusDetail.textContent = message;
 }
 
+function setStopButton(visible, disabled = false) {
+  stopBtn.hidden = !visible;
+  stopBtn.disabled = !visible || disabled;
+}
+
+function setChunkActionControls(visible, disabled = false) {
+  chunkActionRow.hidden = !visible;
+  chunkRetryBtn.disabled = !visible || disabled;
+  chunkSkipBtn.disabled = !visible || disabled;
+}
+
+function resetGeminiConsole() {
+  latestLogSeq = 0;
+  geminiConsole.textContent = '';
+  geminiConsoleCount.textContent = '0行';
+}
+
+function formatGeminiLogLine(entry = {}) {
+  const time = String(entry.time || '--:--:--');
+  const chunk = String(entry.chunk || '').trim();
+  const message = String(entry.message || '').trim();
+  if (!message) {
+    return '';
+  }
+  if (chunk) {
+    return `[${time}] [${chunk}] ${message}`;
+  }
+  return `[${time}] ${message}`;
+}
+
+function syncGeminiConsole(logs = []) {
+  const entries = Array.isArray(logs) ? logs : [];
+  if (entries.length === 0) {
+    if (latestLogSeq !== 0 || geminiConsole.textContent !== '') {
+      geminiConsole.textContent = '';
+      latestLogSeq = 0;
+    }
+    geminiConsoleCount.textContent = '0行';
+    return;
+  }
+
+  const firstSeq = Number(entries[0]?.seq || 0);
+  const lastSeq = Number(entries[entries.length - 1]?.seq || 0);
+  const autoScroll = (geminiConsole.scrollTop + geminiConsole.clientHeight) >= (geminiConsole.scrollHeight - 20);
+
+  if (latestLogSeq === 0 || firstSeq > latestLogSeq + 1 || lastSeq < latestLogSeq) {
+    geminiConsole.textContent = '';
+    latestLogSeq = 0;
+  }
+
+  const nextLines = [];
+  entries.forEach((entry) => {
+    const seq = Number(entry?.seq || 0);
+    if (!Number.isFinite(seq) || seq <= latestLogSeq) {
+      return;
+    }
+    const line = formatGeminiLogLine(entry);
+    if (!line) {
+      return;
+    }
+    nextLines.push(line);
+  });
+
+  if (nextLines.length > 0) {
+    const prefix = geminiConsole.textContent ? '\n' : '';
+    geminiConsole.textContent += `${prefix}${nextLines.join('\n')}`;
+    latestLogSeq = lastSeq;
+  }
+
+  geminiConsoleCount.textContent = `${entries.length}行`;
+  if (autoScroll) {
+    geminiConsole.scrollTop = geminiConsole.scrollHeight;
+  }
+}
+
 function formatList(items, limit = 12) {
   const values = Array.isArray(items) ? items.map((v) => String(v || '').trim()).filter(Boolean) : [];
   if (values.length === 0) {
@@ -96,7 +179,8 @@ function buildJobDetail(data = {}) {
   const hasFailed = Array.isArray(data.failedChunks) && data.failedChunks.length > 0;
   const hasWarnings = Array.isArray(data.warnings) && data.warnings.length > 0;
   const hasError = Boolean(String(data.error || '').trim());
-  if (!hasFailed && !hasWarnings && !hasError) {
+  const hasPending = Boolean(String(data.pendingChunk || '').trim() || String(data.pendingError || '').trim());
+  if (!hasFailed && !hasWarnings && !hasError && !hasPending) {
     return '';
   }
 
@@ -109,6 +193,12 @@ function buildJobDetail(data = {}) {
   }
   if (Array.isArray(data.failedChunks) && data.failedChunks.length > 0) {
     lines.push(`failed chunks: ${data.failedChunks.join(', ')}`);
+  }
+  if (data.pendingChunk || data.pendingError) {
+    lines.push('');
+    lines.push(`pending chunk: ${String(data.pendingChunk || '-')}`);
+    lines.push('pending error:');
+    lines.push(String(data.pendingError || '-').trim());
   }
   if (data.error) {
     lines.push('');
@@ -1111,6 +1201,50 @@ function stopPolling() {
   }
 }
 
+async function submitChunkAction(action) {
+  if (!currentJobId) {
+    return;
+  }
+  const normalized = String(action || '').trim().toLowerCase();
+  if (normalized !== 'retry' && normalized !== 'skip') {
+    return;
+  }
+
+  setChunkActionControls(true, true);
+  setStatus(`操作を送信中: ${normalized}`);
+
+  try {
+    const res = await fetch(`/api/jobs/${currentJobId}/action`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: normalized }),
+    });
+    const data = await res.json();
+    const snapshot = data?.job || null;
+    if (!res.ok && !snapshot) {
+      const code = data?.error?.code ? `[${data.error.code}] ` : '';
+      throw new Error(`${code}${data?.error?.message || '操作に失敗しました'}`);
+    }
+    const accepted = Boolean(data?.accepted);
+    if (snapshot) {
+      syncGeminiConsole(snapshot.logs);
+      setProgress(snapshot.completedChunks || 0, snapshot.totalChunks || 0);
+      renderActive(Array.isArray(snapshot.activeChunks) ? snapshot.activeChunks : []);
+    }
+    if (!accepted) {
+      setStatus(`操作は受け付けられませんでした: ${normalized}`);
+      setChunkActionControls(snapshot?.status === 'paused', false);
+      pollTimer = setTimeout(() => pollJob(currentJobId), 150);
+      return;
+    }
+    setStatus(`操作を受け付けました: ${normalized}`);
+    pollTimer = setTimeout(() => pollJob(currentJobId), 100);
+  } catch (err) {
+    setChunkActionControls(true, false);
+    setStatus(`操作エラー: ${err.message}`);
+  }
+}
+
 async function pollJob(jobId) {
   try {
     const res = await fetch(`/api/jobs/${jobId}`);
@@ -1125,25 +1259,60 @@ async function pollJob(jobId) {
     const completed = data.completedChunks || 0;
     setProgress(completed, total);
     renderActive(Array.isArray(data.activeChunks) ? data.activeChunks : []);
+    syncGeminiConsole(data.logs);
 
     if (data.status === 'queued') {
       setStatus('ジョブをキューに登録しました...');
       const detail = buildJobDetail(data);
       setStatusDetail(detail);
-      pollTimer = setTimeout(() => pollJob(jobId), 1000);
+      setStopButton(true, false);
+      setChunkActionControls(false, true);
+      pollTimer = setTimeout(() => pollJob(jobId), POLL_IDLE_MS);
       return;
     }
 
     if (data.status === 'running') {
       setStatus('Geminiでカードを生成中です...');
       setStatusDetail(buildJobDetail(data));
-      pollTimer = setTimeout(() => pollJob(jobId), 1200);
+      setStopButton(true, false);
+      setChunkActionControls(false, true);
+      pollTimer = setTimeout(() => pollJob(jobId), POLL_ACTIVE_MS);
+      return;
+    }
+
+    if (data.status === 'paused') {
+      setStatus('チャンク処理エラーで一時停止中です。リトライまたはスキップを選択してください。');
+      setStatusDetail(buildJobDetail(data));
+      setStopButton(true, false);
+      setChunkActionControls(true, false);
+      pollTimer = setTimeout(() => pollJob(jobId), POLL_IDLE_MS);
+      return;
+    }
+
+    if (data.status === 'stopping') {
+      setStatus('停止処理中です...');
+      setStatusDetail(buildJobDetail(data));
+      setStopButton(true, true);
+      setChunkActionControls(false, true);
+      pollTimer = setTimeout(() => pollJob(jobId), POLL_ACTIVE_MS);
+      return;
+    }
+
+    if (data.status === 'stopped') {
+      stopPolling();
+      startBtn.disabled = false;
+      setStopButton(false, true);
+      setChunkActionControls(false, true);
+      setStatus('停止しました。');
+      setStatusDetail(buildJobDetail(data));
       return;
     }
 
     if (data.status === 'failed') {
       stopPolling();
       startBtn.disabled = false;
+      setStopButton(false, true);
+      setChunkActionControls(false, true);
       setStatus('失敗しました。詳細を確認してください。');
       setStatusDetail(buildJobDetail(data) || String(data.error || 'unknown error'));
       return;
@@ -1152,6 +1321,8 @@ async function pollJob(jobId) {
     if (data.status === 'completed') {
       stopPolling();
       startBtn.disabled = false;
+      setStopButton(false, true);
+      setChunkActionControls(false, true);
       setStatus('完了しました。テーブルで内容を修正できます。');
       setStatusDetail(buildJobDetail(data));
       cards = Array.isArray(data.cards) ? data.cards.map(normalizeCard) : [];
@@ -1164,10 +1335,12 @@ async function pollJob(jobId) {
       return;
     }
 
-    pollTimer = setTimeout(() => pollJob(jobId), 1200);
+    pollTimer = setTimeout(() => pollJob(jobId), POLL_IDLE_MS);
   } catch (err) {
     stopPolling();
     startBtn.disabled = false;
+    setStopButton(false, true);
+    setChunkActionControls(false, true);
     setStatus(`エラー: ${err.message}`);
     setStatusDetail(String(err.message || err));
   }
@@ -1180,9 +1353,12 @@ form.addEventListener('submit', async (event) => {
   currentJobId = '';
   cards = [];
   resultCard.hidden = true;
+  resetGeminiConsole();
 
   const formData = new FormData(form);
   startBtn.disabled = true;
+  setStopButton(false, true);
+  setChunkActionControls(false, true);
   setStatus('ジョブ作成中...');
   setStatusDetail('');
   setProgress(0, 1);
@@ -1202,12 +1378,55 @@ form.addEventListener('submit', async (event) => {
 
     currentJobId = data.jobId;
     setStatus(`ジョブ開始: ${currentJobId}`);
-    pollJob(currentJobId);
+    setStopButton(true, false);
+    setChunkActionControls(false, true);
+    void pollJob(currentJobId);
   } catch (err) {
     startBtn.disabled = false;
+    setStopButton(false, true);
+    setChunkActionControls(false, true);
     setStatus(`エラー: ${err.message}`);
     setStatusDetail(String(err.message || err));
   }
+});
+
+stopBtn.addEventListener('click', async () => {
+  if (!currentJobId || stopBtn.disabled) {
+    return;
+  }
+
+  stopBtn.disabled = true;
+  setStatus('停止要求を送信中...');
+
+  try {
+    const res = await fetch(`/api/jobs/${currentJobId}/stop`, { method: 'POST' });
+    const data = await res.json();
+    const snapshot = data?.job || null;
+    if (!res.ok && !snapshot) {
+      const code = data?.error?.code ? `[${data.error.code}] ` : '';
+      throw new Error(`${code}${data?.error?.message || '停止要求に失敗しました'}`);
+    }
+    if (snapshot) {
+      syncGeminiConsole(snapshot.logs);
+      setProgress(snapshot.completedChunks || 0, snapshot.totalChunks || 0);
+      renderActive(Array.isArray(snapshot.activeChunks) ? snapshot.activeChunks : []);
+    }
+    setStatus('停止要求を送信しました。停止まで少し待ってください。');
+    setStatusDetail(snapshot ? buildJobDetail(snapshot) : '');
+    setChunkActionControls(false, true);
+    pollTimer = setTimeout(() => pollJob(currentJobId), 120);
+  } catch (err) {
+    stopBtn.disabled = false;
+    setStatus(`停止要求エラー: ${err.message}`);
+  }
+});
+
+chunkRetryBtn.addEventListener('click', () => {
+  void submitChunkAction('retry');
+});
+
+chunkSkipBtn.addEventListener('click', () => {
+  void submitChunkAction('skip');
 });
 
 searchInput.addEventListener('input', renderTable);
@@ -1274,5 +1493,8 @@ setProgress(0, 1);
 updateSummary();
 setupPreviewCollapsedState();
 resetPreviewFile();
+setStopButton(false, true);
+setChunkActionControls(false, true);
+resetGeminiConsole();
 
 pdfPreviewReady = configurePdfJs();

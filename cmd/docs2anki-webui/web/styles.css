@@ -322,6 +322,36 @@ button:disabled {
   align-items: center;
 }
 
+.progress-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.progress-head h2 {
+  margin: 0;
+}
+
+#stop-btn {
+  padding: 7px 12px;
+  font-size: 13px;
+}
+
+#stop-btn[hidden] {
+  display: none !important;
+}
+
+.danger-btn {
+  border-color: #8f2f2f;
+  background: #b54040;
+}
+
+.danger-btn:disabled {
+  opacity: 0.55;
+}
+
 .bar {
   border: 1px solid var(--line);
   background: #eef4ef;
@@ -341,6 +371,17 @@ button:disabled {
   margin-top: 10px;
   color: var(--muted);
   min-height: 20px;
+}
+
+.chunk-action-row {
+  margin-top: 8px;
+  display: flex;
+  gap: 8px;
+}
+
+.ghost-btn {
+  background: #ffffff;
+  border-color: #c2d1c8;
 }
 
 .status-detail-box {
@@ -381,6 +422,67 @@ button:disabled {
   border-radius: 999px;
   padding: 4px 10px;
   font-size: 12px;
+}
+
+.console-box {
+  margin-top: 10px;
+  border: 1px solid #c8d7ce;
+  border-radius: 10px;
+  background: #f8fcf9;
+  overflow: hidden;
+}
+
+.console-box summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  font-size: 13px;
+  color: #2b5d49;
+  user-select: none;
+}
+
+.console-box summary::-webkit-details-marker {
+  display: none;
+}
+
+.console-box summary::before {
+  content: "▸";
+  color: #326c54;
+  margin-right: 6px;
+  font-size: 14px;
+  transition: transform .15s ease;
+}
+
+.console-box[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.console-box summary > span:first-child {
+  display: inline-flex;
+  align-items: center;
+}
+
+.console-count {
+  color: #527364;
+  font-size: 12px;
+}
+
+.console-output {
+  margin: 0;
+  border-top: 1px solid #d9e4dd;
+  padding: 10px;
+  min-height: 120px;
+  max-height: 280px;
+  overflow: auto;
+  background: #0f1713;
+  color: #daf4e5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 .result-head {

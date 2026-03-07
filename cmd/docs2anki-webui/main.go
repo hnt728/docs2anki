@@ -13,7 +13,6 @@ import (
 	"io/fs"
 	"log"
 	"math"
-	"math/rand"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -33,6 +32,9 @@ const (
 	defaultModel            = "gemini-3-flash-preview"
 	defaultMaxChunkPDFBytes = int64(19 * 1024 * 1024) // warning threshold
 	optimizedSourceFileName = "source.optimized.pdf"
+	maxJobLogEntries        = 900
+	maxJobLogMessageBytes   = 700
+	streamLogChunkBytes     = 220
 )
 
 type sourceKind string
@@ -99,9 +101,7 @@ type processOptions struct {
 	FrontPrompt    string
 	BackPrompt     string
 	MinConfidence  float64
-	Concurrency    int
 	DelayMS        int
-	Retries        int
 	ThinkingBudget int
 }
 
@@ -122,9 +122,7 @@ type jobConfigSummary struct {
 	FrontPrompt    string  `json:"frontPrompt"`
 	BackPrompt     string  `json:"backPrompt"`
 	MinConfidence  float64 `json:"minConfidence"`
-	Concurrency    int     `json:"concurrency"`
 	DelayMS        int     `json:"delayMs"`
-	Retries        int     `json:"retries"`
 	ThinkingBudget int     `json:"thinkingBudget"`
 }
 
@@ -160,17 +158,27 @@ type chunkAsset struct {
 	Page        int
 }
 
-type chunkResult struct {
-	Index int
-	Range pageRange
-	Label string
-	Cards []Card
-	Err   error
-}
-
 type jobStore struct {
 	mu   sync.RWMutex
 	jobs map[string]*job
+}
+
+type chunkDecision string
+
+const (
+	chunkDecisionRetry chunkDecision = "retry"
+	chunkDecisionSkip  chunkDecision = "skip"
+)
+
+type jobActionRequest struct {
+	Action string `json:"action"`
+}
+
+type jobLogEntry struct {
+	Seq     int64  `json:"seq"`
+	Time    string `json:"time"`
+	Chunk   string `json:"chunk,omitempty"`
+	Message string `json:"message"`
 }
 
 type job struct {
@@ -187,12 +195,20 @@ type job struct {
 	ActiveChunks    []string `json:"activeChunks"`
 	FailedChunks    []string `json:"failedChunks,omitempty"`
 
-	IssueCount int      `json:"issueCount"`
-	Warnings   []string `json:"warnings,omitempty"`
-	Error      string   `json:"error,omitempty"`
-	Cards      []Card   `json:"cards,omitempty"`
+	IssueCount int           `json:"issueCount"`
+	Warnings   []string      `json:"warnings,omitempty"`
+	Error      string        `json:"error,omitempty"`
+	Cards      []Card        `json:"cards,omitempty"`
+	Logs       []jobLogEntry `json:"logs,omitempty"`
+
+	StopRequested bool   `json:"stopRequested,omitempty"`
+	PendingChunk  string `json:"pendingChunk,omitempty"`
+	PendingError  string `json:"pendingError,omitempty"`
 
 	activeSet map[string]struct{}
+	cancelFn  context.CancelFunc
+	nextLogID int64
+	decisionQ chan chunkDecision
 }
 
 func newJobStore() *jobStore {
@@ -207,6 +223,7 @@ func (s *jobStore) create(cfg jobConfigSummary) *job {
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 		activeSet: make(map[string]struct{}),
+		decisionQ: make(chan chunkDecision, 1),
 	}
 	s.mu.Lock()
 	s.jobs[j.ID] = j
@@ -223,7 +240,11 @@ func (s *jobStore) get(id string) (*job, bool) {
 
 func (j *job) markRunning(totalChunks int) {
 	j.mu.Lock()
-	j.Status = "running"
+	if j.StopRequested {
+		j.Status = "stopping"
+	} else {
+		j.Status = "running"
+	}
 	j.TotalChunks = totalChunks
 	j.UpdatedAt = time.Now()
 	j.mu.Unlock()
@@ -272,6 +293,21 @@ func (j *job) markCompleted(cards []Card, failedChunks []string, warnings []stri
 	j.FailedChunks = append([]string{}, failedChunks...)
 	j.Warnings = append([]string{}, warnings...)
 	j.ActiveChunks = nil
+	j.StopRequested = false
+	j.PendingChunk = ""
+	j.PendingError = ""
+	j.activeSet = make(map[string]struct{})
+	j.UpdatedAt = time.Now()
+	j.mu.Unlock()
+}
+
+func (j *job) markStopped() {
+	j.mu.Lock()
+	j.Status = "stopped"
+	j.Error = ""
+	j.ActiveChunks = nil
+	j.PendingChunk = ""
+	j.PendingError = ""
 	j.activeSet = make(map[string]struct{})
 	j.UpdatedAt = time.Now()
 	j.mu.Unlock()
@@ -282,9 +318,177 @@ func (j *job) markFailed(err error) {
 	j.Status = "failed"
 	j.Error = err.Error()
 	j.ActiveChunks = nil
+	j.PendingChunk = ""
+	j.PendingError = ""
 	j.activeSet = make(map[string]struct{})
 	j.UpdatedAt = time.Now()
 	j.mu.Unlock()
+}
+
+func (j *job) setCancel(cancel context.CancelFunc) {
+	var shouldCancel bool
+
+	j.mu.Lock()
+	j.cancelFn = cancel
+	if j.StopRequested && cancel != nil {
+		shouldCancel = true
+	}
+	j.mu.Unlock()
+
+	if shouldCancel {
+		cancel()
+	}
+}
+
+func (j *job) clearCancel() {
+	j.mu.Lock()
+	j.cancelFn = nil
+	j.mu.Unlock()
+}
+
+func (j *job) isStopRequested() bool {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	return j.StopRequested
+}
+
+func (j *job) requestStop() bool {
+	var cancel context.CancelFunc
+
+	j.mu.Lock()
+	switch j.Status {
+	case "completed", "failed", "stopped":
+		j.mu.Unlock()
+		return false
+	}
+	j.StopRequested = true
+	if j.Status == "queued" || j.Status == "running" || j.Status == "paused" {
+		j.Status = "stopping"
+	}
+	cancel = j.cancelFn
+	j.UpdatedAt = time.Now()
+	j.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	return true
+}
+
+func (j *job) pauseForChunkIssue(label string, err error) {
+	message := strings.TrimSpace(err.Error())
+	if message == "" {
+		message = "unknown error"
+	}
+	j.clearDecisionQueue()
+
+	j.mu.Lock()
+	if j.StopRequested {
+		j.Status = "stopping"
+	} else {
+		j.Status = "paused"
+	}
+	j.PendingChunk = strings.TrimSpace(label)
+	j.PendingError = message
+	j.UpdatedAt = time.Now()
+	j.mu.Unlock()
+}
+
+func (j *job) resumeFromChunkIssue() {
+	j.mu.Lock()
+	j.PendingChunk = ""
+	j.PendingError = ""
+	if j.StopRequested {
+		j.Status = "stopping"
+	} else {
+		j.Status = "running"
+	}
+	j.UpdatedAt = time.Now()
+	j.mu.Unlock()
+	j.clearDecisionQueue()
+}
+
+func (j *job) submitChunkDecision(decision chunkDecision) bool {
+	if decision != chunkDecisionRetry && decision != chunkDecisionSkip {
+		return false
+	}
+
+	j.mu.RLock()
+	paused := j.Status == "paused"
+	pendingChunk := strings.TrimSpace(j.PendingChunk)
+	j.mu.RUnlock()
+	if !paused || pendingChunk == "" {
+		return false
+	}
+
+	select {
+	case j.decisionQ <- decision:
+		return true
+	default:
+		// Drop stale value and retry once.
+		select {
+		case <-j.decisionQ:
+		default:
+		}
+		select {
+		case j.decisionQ <- decision:
+			return true
+		default:
+			return false
+		}
+	}
+}
+
+func (j *job) waitChunkDecision(ctx context.Context) (chunkDecision, error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case decision := <-j.decisionQ:
+			if decision == chunkDecisionRetry || decision == chunkDecisionSkip {
+				return decision, nil
+			}
+		}
+	}
+}
+
+func (j *job) clearDecisionQueue() {
+	for {
+		select {
+		case <-j.decisionQ:
+		default:
+			return
+		}
+	}
+}
+
+func (j *job) appendLog(chunk string, message string) {
+	msg := strings.TrimSpace(strings.ReplaceAll(message, "\r", ""))
+	if msg == "" {
+		return
+	}
+	if len(msg) > maxJobLogMessageBytes {
+		msg = strings.TrimSpace(msg[:maxJobLogMessageBytes]) + " ..."
+	}
+	entryTime := time.Now()
+
+	j.mu.Lock()
+	j.nextLogID++
+	j.Logs = append(j.Logs, jobLogEntry{
+		Seq:     j.nextLogID,
+		Time:    entryTime.Format("15:04:05"),
+		Chunk:   strings.TrimSpace(chunk),
+		Message: msg,
+	})
+	if len(j.Logs) > maxJobLogEntries {
+		j.Logs = append([]jobLogEntry{}, j.Logs[len(j.Logs)-maxJobLogEntries:]...)
+	}
+	j.UpdatedAt = entryTime
+	j.mu.Unlock()
+}
+
+func (j *job) appendLogf(chunk string, format string, args ...any) {
+	j.appendLog(chunk, fmt.Sprintf(format, args...))
 }
 
 func (j *job) snapshot() job {
@@ -295,7 +499,11 @@ func (j *job) snapshot() job {
 	cp.FailedChunks = append([]string{}, j.FailedChunks...)
 	cp.Warnings = append([]string{}, j.Warnings...)
 	cp.Cards = append([]Card{}, j.Cards...)
+	cp.Logs = append([]jobLogEntry{}, j.Logs...)
 	cp.activeSet = nil
+	cp.cancelFn = nil
+	cp.nextLogID = 0
+	cp.decisionQ = nil
 	cp.mu = sync.RWMutex{}
 	return cp
 }
@@ -334,7 +542,7 @@ func main() {
 	mux.HandleFunc("/", application.handleIndex)
 	mux.Handle("/static/", application.handleStatic())
 	mux.HandleFunc("/api/jobs", application.handleCreateJob)
-	mux.HandleFunc("/api/jobs/", application.handleGetJob)
+	mux.HandleFunc("/api/jobs/", application.handleJobRequest)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -422,19 +630,30 @@ func (a *app) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		FrontPrompt:    opts.FrontPrompt,
 		BackPrompt:     opts.BackPrompt,
 		MinConfidence:  opts.MinConfidence,
-		Concurrency:    opts.Concurrency,
 		DelayMS:        opts.DelayMS,
-		Retries:        opts.Retries,
 		ThinkingBudget: opts.ThinkingBudget,
 	})
 
 	go func(j *job, uploaded []uploadedSource, options processOptions) {
 		defer cleanupUploadedSources(uploaded)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
-		defer cancel()
+		j.setCancel(cancel)
+		defer func() {
+			cancel()
+			j.clearCancel()
+		}()
+
+		j.appendLogf("system", "ジョブ開始: model=%s", options.Model)
 
 		if err := runJob(ctx, j, uploaded, options); err != nil {
+			if errors.Is(err, context.Canceled) && j.isStopRequested() {
+				j.markStopped()
+				j.appendLog("system", "停止しました。")
+				log.Printf("job %s stopped", j.ID)
+				return
+			}
 			j.markFailed(err)
+			j.appendLogf("system", "ジョブ失敗: %v", err)
 			log.Printf("job %s failed: %v", j.ID, err)
 		}
 	}(currentJob, sources, opts)
@@ -442,22 +661,94 @@ func (a *app) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]string{"jobId": currentJob.ID})
 }
 
-func (a *app) handleGetJob(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "GET only")
-		return
+func parseJobRequestPath(path string) (id string, action string, ok bool) {
+	trimmed := strings.TrimPrefix(path, "/api/jobs/")
+	if trimmed == "" {
+		return "", "", false
 	}
-	id := strings.TrimPrefix(r.URL.Path, "/api/jobs/")
-	if id == "" || strings.Contains(id, "/") {
-		writeError(w, http.StatusNotFound, "not_found", "job not found")
-		return
+	parts := strings.Split(trimmed, "/")
+	if len(parts) == 1 && strings.TrimSpace(parts[0]) != "" {
+		return parts[0], "", true
 	}
-	job, ok := a.jobs.get(id)
+	if len(parts) == 2 && strings.TrimSpace(parts[0]) != "" && parts[1] == "stop" {
+		return parts[0], "stop", true
+	}
+	if len(parts) == 2 && strings.TrimSpace(parts[0]) != "" && parts[1] == "action" {
+		return parts[0], "action", true
+	}
+	return "", "", false
+}
+
+func (a *app) handleJobRequest(w http.ResponseWriter, r *http.Request) {
+	id, action, ok := parseJobRequestPath(r.URL.Path)
 	if !ok {
 		writeError(w, http.StatusNotFound, "not_found", "job not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, job.snapshot())
+
+	currentJob, exists := a.jobs.get(id)
+	if !exists {
+		writeError(w, http.StatusNotFound, "not_found", "job not found")
+		return
+	}
+
+	if action == "stop" {
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST only")
+			return
+		}
+		accepted := currentJob.requestStop()
+		if accepted {
+			currentJob.appendLog("system", "停止要求を受け付けました。")
+		}
+		statusCode := http.StatusAccepted
+		if !accepted {
+			statusCode = http.StatusConflict
+		}
+		writeJSON(w, statusCode, map[string]any{
+			"accepted": accepted,
+			"job":      currentJob.snapshot(),
+		})
+		return
+	}
+
+	if action == "action" {
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST only")
+			return
+		}
+
+		var payload jobActionRequest
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_action", "action payload is invalid")
+			return
+		}
+
+		decision := chunkDecision(strings.ToLower(strings.TrimSpace(payload.Action)))
+		if decision != chunkDecisionRetry && decision != chunkDecisionSkip {
+			writeError(w, http.StatusBadRequest, "invalid_action", "action must be retry or skip")
+			return
+		}
+		accepted := currentJob.submitChunkDecision(decision)
+		if accepted {
+			currentJob.appendLogf("system", "ユーザー操作: %s", decision)
+		}
+		statusCode := http.StatusAccepted
+		if !accepted {
+			statusCode = http.StatusConflict
+		}
+		writeJSON(w, statusCode, map[string]any{
+			"accepted": accepted,
+			"job":      currentJob.snapshot(),
+		})
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "GET only")
+		return
+	}
+	writeJSON(w, http.StatusOK, currentJob.snapshot())
 }
 
 func runJob(ctx context.Context, job *job, sources []uploadedSource, opts processOptions) error {
@@ -471,8 +762,10 @@ func runJob(ctx context.Context, job *job, sources []uploadedSource, opts proces
 	}
 
 	job.markRunning(len(chunks))
+	job.appendLogf("system", "処理開始: chunks=%d", len(chunks))
 	for _, msg := range prepWarnings {
 		job.appendWarning(msg)
+		job.appendLogf("system", "warning: %s", msg)
 	}
 
 	client, err := genai.NewClient(ctx, &genai.ClientConfig{
@@ -483,62 +776,62 @@ func runJob(ctx context.Context, job *job, sources []uploadedSource, opts proces
 		return fmt.Errorf("Geminiクライアント作成に失敗: %w", err)
 	}
 
-	workerCount := opts.Concurrency
-	if workerCount > len(chunks) {
-		workerCount = len(chunks)
-	}
-	if workerCount < 1 {
-		workerCount = 1
-	}
-
-	tasks := make(chan chunkTask)
-	results := make(chan chunkResult, len(chunks))
-	var workers sync.WaitGroup
-
-	for i := 0; i < workerCount; i++ {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			for task := range tasks {
-				label := taskLabel(task)
-				job.markChunkStart(label)
-				cards, runErr := runChunkWithRetry(ctx, client, opts, task)
-				job.markChunkDone(label)
-				results <- chunkResult{
-					Index: task.Index,
-					Range: task.Range,
-					Label: label,
-					Cards: cards,
-					Err:   runErr,
-				}
-			}
-		}()
-	}
-
-	go func() {
-		for _, task := range chunks {
-			tasks <- task
-		}
-		close(tasks)
-		workers.Wait()
-		close(results)
-	}()
-
 	cardsByChunk := make([][]Card, len(chunks))
 	failedChunks := make([]string, 0)
 	warnings := append([]string{}, prepWarnings...)
 	failedCount := 0
 
-	for res := range results {
-		if res.Err != nil {
+	for _, task := range chunks {
+		if ctx.Err() != nil && job.isStopRequested() {
+			return context.Canceled
+		}
+
+		label := taskLabel(task)
+		job.markChunkStart(label)
+		job.appendLog(label, "開始")
+		for {
+			cards, runErr := runChunk(ctx, client, opts, task, func(message string) {
+				job.appendLog(label, message)
+			})
+			if runErr == nil {
+				job.appendLogf(label, "完了: cards=%d", len(cards))
+				cardsByChunk[task.Index] = cards
+				break
+			}
+
+			if errors.Is(runErr, context.Canceled) && job.isStopRequested() {
+				return context.Canceled
+			}
+
+			job.appendLogf(label, "エラー: %v", runErr)
+			job.pauseForChunkIssue(label, runErr)
+			decision, err := job.waitChunkDecision(ctx)
+			if err != nil {
+				if errors.Is(err, context.Canceled) && job.isStopRequested() {
+					return context.Canceled
+				}
+				return err
+			}
+			job.resumeFromChunkIssue()
+
+			if decision == chunkDecisionRetry {
+				job.appendLog(label, "リトライします。")
+				continue
+			}
+
 			failedCount++
-			failedChunks = append(failedChunks, res.Label)
-			warning := fmt.Sprintf("%s の処理に失敗: %v", res.Label, res.Err)
+			failedChunks = append(failedChunks, label)
+			warning := fmt.Sprintf("%s をスキップ: %v", label, runErr)
 			warnings = append(warnings, warning)
 			job.appendWarning(warning)
-			continue
+			job.appendLog(label, "スキップしました。")
+			break
 		}
-		cardsByChunk[res.Index] = res.Cards
+		job.markChunkDone(label)
+	}
+
+	if ctx.Err() != nil && job.isStopRequested() {
+		return context.Canceled
 	}
 
 	if failedCount == len(chunks) {
@@ -555,6 +848,7 @@ func runJob(ctx context.Context, job *job, sources []uploadedSource, opts proces
 	}
 
 	job.markCompleted(allCards, failedChunks, warnings)
+	job.appendLogf("system", "完了: cards=%d failedChunks=%d", len(allCards), len(failedChunks))
 	return nil
 }
 
@@ -660,9 +954,12 @@ type uploadedChunkFile struct {
 	Page     int
 }
 
-func runChunkWithRetry(ctx context.Context, client *genai.Client, opts processOptions, task chunkTask) ([]Card, error) {
+func runChunk(ctx context.Context, client *genai.Client, opts processOptions, task chunkTask, onLog func(string)) ([]Card, error) {
 	if len(task.Assets) == 0 {
 		return nil, fmt.Errorf("チャンクにファイルが含まれていません")
+	}
+	if onLog == nil {
+		onLog = func(string) {}
 	}
 
 	uploadedFiles := make([]uploadedChunkFile, 0, len(task.Assets))
@@ -672,8 +969,10 @@ func runChunkWithRetry(ctx context.Context, client *genai.Client, opts processOp
 			_, _ = client.Files.Delete(context.Background(), name, nil)
 		}
 	}()
+	onLog(fmt.Sprintf("アップロード開始: files=%d", len(task.Assets)))
 
 	for _, asset := range task.Assets {
+		onLog(fmt.Sprintf("アップロード中: page=%d file=%s", asset.Page, asset.DisplayName))
 		uploaded, err := client.Files.UploadFromPath(ctx, asset.Path, &genai.UploadFileConfig{
 			MIMEType:    asset.MIMEType,
 			DisplayName: uploadDisplayNameForAsset(task, asset),
@@ -687,6 +986,7 @@ func runChunkWithRetry(ctx context.Context, client *genai.Client, opts processOp
 		if err != nil {
 			return nil, fmt.Errorf("チャンクファイル準備待ち失敗(%s): %w", taskLabel(task), err)
 		}
+		onLog(fmt.Sprintf("アップロード完了: page=%d", asset.Page))
 		uploadedFiles = append(uploadedFiles, uploadedChunkFile{
 			URI:      uploaded.URI,
 			MIMEType: asset.MIMEType,
@@ -694,41 +994,24 @@ func runChunkWithRetry(ctx context.Context, client *genai.Client, opts processOp
 		})
 	}
 
-	totalAttempts := opts.Retries + 1
-	var lastErr error
-	for attempt := 0; attempt <= opts.Retries; attempt++ {
-		if opts.DelayMS > 0 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(time.Duration(opts.DelayMS) * time.Millisecond):
-			}
-		}
-
-		cards, runErr := runChunkOnce(ctx, client, uploadedFiles, opts, task)
-		if runErr == nil {
-			return cards, nil
-		}
-		lastErr = runErr
-		if attempt == opts.Retries {
-			break
-		}
-		base := 0.5 * math.Pow(2, float64(attempt))
-		jitter := rand.Float64() * 0.3
-		wait := time.Duration((base+jitter)*1000) * time.Millisecond
+	if opts.DelayMS > 0 {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(wait):
+		case <-time.After(time.Duration(opts.DelayMS) * time.Millisecond):
 		}
 	}
-	if lastErr == nil {
-		lastErr = errors.New("unknown chunk processing error")
+
+	onLog("Gemini呼び出し")
+	cards, err := runChunkOnce(ctx, client, uploadedFiles, opts, task, onLog)
+	if err != nil {
+		return nil, fmt.Errorf("チャンク処理失敗(%s, size=%s): %w", taskLabel(task), formatBytes(task.FileSize), err)
 	}
-	return nil, fmt.Errorf("チャンク処理失敗(%s, size=%s, attempts=%d): %w", taskLabel(task), formatBytes(task.FileSize), totalAttempts, lastErr)
+	onLog(fmt.Sprintf("JSON解析完了: cards=%d", len(cards)))
+	return cards, nil
 }
 
-func runChunkOnce(ctx context.Context, client *genai.Client, files []uploadedChunkFile, opts processOptions, task chunkTask) ([]Card, error) {
+func runChunkOnce(ctx context.Context, client *genai.Client, files []uploadedChunkFile, opts processOptions, task chunkTask, onLog func(string)) ([]Card, error) {
 	prompt := buildPrompt(opts.FrontPrompt, opts.BackPrompt, task)
 	parts := make([]*genai.Part, 0, len(files)*2+1)
 	for _, file := range files {
@@ -759,13 +1042,47 @@ func runChunkOnce(ctx context.Context, client *genai.Client, files []uploadedChu
 		cfg.ThinkingConfig = &genai.ThinkingConfig{ThinkingBudget: &budget}
 	}
 
-	resp, err := client.Models.GenerateContent(ctx, opts.Model, contents, cfg)
-	if err != nil {
-		return nil, err
+	collector := newStreamLogCollector(func(line string) {
+		if onLog != nil {
+			onLog("Gemini> " + line)
+		}
+	})
+
+	var fullText strings.Builder
+	var previousText string
+	for resp, err := range client.Models.GenerateContentStream(ctx, opts.Model, contents, cfg) {
+		if err != nil {
+			return nil, err
+		}
+		if resp == nil {
+			continue
+		}
+		piece := resp.Text()
+		if piece == "" {
+			continue
+		}
+		delta := piece
+		if previousText != "" && strings.HasPrefix(piece, previousText) {
+			delta = piece[len(previousText):]
+		}
+		previousText = piece
+		if delta == "" {
+			continue
+		}
+		fullText.WriteString(delta)
+		collector.Push(delta)
 	}
-	text := strings.TrimSpace(resp.Text())
+	collector.Flush()
+
+	text := strings.TrimSpace(fullText.String())
 	if text == "" {
+		if onLog != nil {
+			onLog("Gemini応答が空でした。")
+		}
 		return nil, nil
+	}
+	if onLog != nil {
+		onLog(fmt.Sprintf("Gemini応答受信: %d bytes", len(text)))
 	}
 
 	var raw []map[string]any
@@ -782,6 +1099,60 @@ func runChunkOnce(ctx context.Context, client *genai.Client, files []uploadedChu
 		cards = append(cards, card)
 	}
 	return cards, nil
+}
+
+type streamLogCollector struct {
+	pending string
+	emit    func(string)
+}
+
+func newStreamLogCollector(emit func(string)) *streamLogCollector {
+	return &streamLogCollector{
+		pending: "",
+		emit:    emit,
+	}
+}
+
+func (c *streamLogCollector) Push(fragment string) {
+	if c == nil {
+		return
+	}
+	text := strings.ReplaceAll(fragment, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	c.pending += text
+
+	for {
+		idx := strings.IndexByte(c.pending, '\n')
+		if idx < 0 {
+			break
+		}
+		c.emitLine(c.pending[:idx])
+		c.pending = c.pending[idx+1:]
+	}
+
+	for len(c.pending) > streamLogChunkBytes {
+		c.emitLine(c.pending[:streamLogChunkBytes])
+		c.pending = c.pending[streamLogChunkBytes:]
+	}
+}
+
+func (c *streamLogCollector) Flush() {
+	if c == nil {
+		return
+	}
+	c.emitLine(c.pending)
+	c.pending = ""
+}
+
+func (c *streamLogCollector) emitLine(line string) {
+	if c == nil || c.emit == nil {
+		return
+	}
+	msg := strings.TrimSpace(line)
+	if msg == "" {
+		return
+	}
+	c.emit(msg)
 }
 
 func normalizeCard(item map[string]any, minConfidence float64) (Card, error) {
@@ -956,17 +1327,9 @@ func parseProcessOptions(r *http.Request) (processOptions, error) {
 	opts.Step = step
 	opts.Overlap = overlap
 
-	concurrency, err := parseIntFormValue(r.FormValue("concurrency"), 1)
-	if err != nil || concurrency < 1 {
-		return opts, fmt.Errorf("concurrency は1以上で指定してください")
-	}
 	delayMS, err := parseIntFormValue(r.FormValue("delayMs"), 0)
 	if err != nil || delayMS < 0 {
 		return opts, fmt.Errorf("delayMs は0以上で指定してください")
-	}
-	retries, err := parseIntFormValue(r.FormValue("retries"), 2)
-	if err != nil || retries < 0 {
-		return opts, fmt.Errorf("retries は0以上で指定してください")
 	}
 	budget, err := parseIntFormValue(r.FormValue("thinkingBudget"), 0)
 	if err != nil || budget < -1 {
@@ -983,9 +1346,7 @@ func parseProcessOptions(r *http.Request) (processOptions, error) {
 		minConfidence = 1
 	}
 
-	opts.Concurrency = concurrency
 	opts.DelayMS = delayMS
-	opts.Retries = retries
 	opts.ThinkingBudget = budget
 	opts.MinConfidence = minConfidence
 	return opts, nil
