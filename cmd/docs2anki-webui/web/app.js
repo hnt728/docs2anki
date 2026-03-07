@@ -1,3 +1,29 @@
+const appUtils = window.docs2ankiAppUtils;
+if (!appUtils) {
+  throw new Error('docs2ankiAppUtils failed to load');
+}
+
+const cardsModule = window.docs2ankiCards;
+if (!cardsModule) {
+  throw new Error('docs2ankiCards failed to load');
+}
+
+const jobsModule = window.docs2ankiJobs;
+if (!jobsModule) {
+  throw new Error('docs2ankiJobs failed to load');
+}
+
+const {
+  computeChunks,
+  inferMimeFromName,
+  normalizePreviewMIME,
+  parseRangesExpression,
+  rangeExpressionForCount,
+} = appUtils;
+
+const { createCardsController } = cardsModule;
+const { createJobsController } = jobsModule;
+
 const form = document.getElementById('job-form');
 const startBtn = document.getElementById('start-btn');
 const barFill = document.getElementById('bar-fill');
@@ -54,9 +80,6 @@ const settingHelpTexts = Object.freeze({
   thinkingBudget: 'Thinking Budget: Geminiの思考予算です。-1 は動的、0以上は予算指定です。モデルやAPIバージョンによって実際の挙動は異なる場合があります。',
 });
 
-let pollTimer = null;
-let currentJobId = '';
-let cards = [];
 let latestLogSeq = 0;
 
 let previewMode = 'none'; // none | pdf | image
@@ -163,56 +186,6 @@ function syncGeminiConsole(logs = []) {
   }
 }
 
-function formatList(items, limit = 12) {
-  const values = Array.isArray(items) ? items.map((v) => String(v || '').trim()).filter(Boolean) : [];
-  if (values.length === 0) {
-    return '';
-  }
-  const head = values.slice(0, limit).map((v) => `- ${v}`).join('\n');
-  if (values.length <= limit) {
-    return head;
-  }
-  return `${head}\n- ... ほか ${values.length - limit} 件`;
-}
-
-function buildJobDetail(data = {}) {
-  const hasFailed = Array.isArray(data.failedChunks) && data.failedChunks.length > 0;
-  const hasWarnings = Array.isArray(data.warnings) && data.warnings.length > 0;
-  const hasError = Boolean(String(data.error || '').trim());
-  const hasPending = Boolean(String(data.pendingChunk || '').trim() || String(data.pendingError || '').trim());
-  if (!hasFailed && !hasWarnings && !hasError && !hasPending) {
-    return '';
-  }
-
-  const lines = [];
-  if (data.jobId || currentJobId) {
-    lines.push(`job: ${data.jobId || currentJobId}`);
-  }
-  if (data.status) {
-    lines.push(`status: ${data.status}`);
-  }
-  if (Array.isArray(data.failedChunks) && data.failedChunks.length > 0) {
-    lines.push(`failed chunks: ${data.failedChunks.join(', ')}`);
-  }
-  if (data.pendingChunk || data.pendingError) {
-    lines.push('');
-    lines.push(`pending chunk: ${String(data.pendingChunk || '-')}`);
-    lines.push('pending error:');
-    lines.push(String(data.pendingError || '-').trim());
-  }
-  if (data.error) {
-    lines.push('');
-    lines.push('error:');
-    lines.push(String(data.error).trim());
-  }
-  if (Array.isArray(data.warnings) && data.warnings.length > 0) {
-    lines.push('');
-    lines.push('warnings:');
-    lines.push(formatList(data.warnings, 14));
-  }
-  return lines.join('\n').trim();
-}
-
 function setProgress(completed, total) {
   const safeTotal = total > 0 ? total : 1;
   const percent = Math.min(100, Math.round((completed / safeTotal) * 100));
@@ -234,77 +207,6 @@ function renderActive(labels = []) {
   }
 }
 
-function escapeHTML(value) {
-  return String(value ?? '')
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;');
-}
-
-function normalizeCard(card = {}) {
-  return {
-    page: String(card.page ?? ''),
-    question: String(card.question ?? ''),
-    answer: String(card.answer ?? ''),
-    confidence: Number.isFinite(Number(card.confidence)) ? Number(card.confidence) : 0,
-    issue: Array.isArray(card.issue) ? card.issue.map((x) => String(x)).filter(Boolean) : [],
-  };
-}
-
-function parseRangesExpression(expression) {
-  const parts = String(expression || '').split(',').map((v) => v.trim()).filter(Boolean);
-  if (parts.length === 0) {
-    throw new Error('ページ範囲を指定してください');
-  }
-
-  const ranges = [];
-  for (const part of parts) {
-    if (part.includes('-')) {
-      const [left, right] = part.split('-', 2).map((v) => v.trim());
-      const start = Number.parseInt(left, 10);
-      const end = Number.parseInt(right, 10);
-      if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < 1 || end < start) {
-        throw new Error(`範囲指定が不正です: ${part}`);
-      }
-      ranges.push({ start, end });
-      continue;
-    }
-
-    const page = Number.parseInt(part, 10);
-    if (!Number.isInteger(page) || page < 1) {
-      throw new Error(`ページ指定が不正です: ${part}`);
-    }
-    ranges.push({ start: page, end: page });
-  }
-
-  ranges.sort((a, b) => {
-    if (a.start === b.start) {
-      return a.end - b.end;
-    }
-    return a.start - b.start;
-  });
-
-  const merged = [];
-  for (const current of ranges) {
-    const last = merged[merged.length - 1];
-    if (!last) {
-      merged.push({ ...current });
-      continue;
-    }
-    if (current.start <= last.end + 1) {
-      if (current.end > last.end) {
-        last.end = current.end;
-      }
-      continue;
-    }
-    merged.push({ ...current });
-  }
-
-  return merged;
-}
-
 function parseStepOverlap() {
   const step = Number.parseInt(stepInput.value || '1', 10);
   const overlap = Number.parseInt(overlapInput.value || '0', 10);
@@ -317,52 +219,6 @@ function parseStepOverlap() {
   }
 
   return { step, overlap };
-}
-
-function computeChunks(ranges, step, overlap) {
-  const chunks = [];
-  const stride = step - overlap;
-
-  ranges.forEach((range) => {
-    let page = range.start;
-    while (page <= range.end) {
-      const end = Math.min(page + step - 1, range.end);
-      chunks.push({ start: page, end });
-      if (end === range.end) {
-        break;
-      }
-      page += stride;
-    }
-  });
-
-  return chunks;
-}
-
-function rangeExpressionForCount(count) {
-  const total = Number.parseInt(String(count || 0), 10);
-  if (!Number.isInteger(total) || total < 1) {
-    return '';
-  }
-  if (total === 1) {
-    return '1';
-  }
-  return `1-${total}`;
-}
-
-function normalizePreviewMIME(value) {
-  return String(value || '').trim().toLowerCase().split(';', 1)[0];
-}
-
-function inferMimeFromName(name) {
-  const lowered = String(name || '').trim().toLowerCase();
-  if (lowered.endsWith('.pdf')) return 'application/pdf';
-  if (lowered.endsWith('.png')) return 'image/png';
-  if (lowered.endsWith('.jpg') || lowered.endsWith('.jpeg')) return 'image/jpeg';
-  if (lowered.endsWith('.webp')) return 'image/webp';
-  if (lowered.endsWith('.gif')) return 'image/gif';
-  if (lowered.endsWith('.bmp')) return 'image/bmp';
-  if (lowered.endsWith('.tif') || lowered.endsWith('.tiff')) return 'image/tiff';
-  return '';
 }
 
 function getSourceKind(file) {
@@ -1094,358 +950,11 @@ function movePreviewPage(delta) {
   void renderPreviewPage();
 }
 
-function renderTable() {
-  const keyword = searchInput.value.trim().toLowerCase();
-  const issueOnly = onlyIssues.checked;
-
-  tableBody.innerHTML = '';
-
-  const visible = cards.filter((card) => {
-    const hasIssue = card.issue.length > 0;
-    if (issueOnly && !hasIssue) {
-      return false;
-    }
-    if (!keyword) {
-      return true;
-    }
-    const merged = `${card.page} ${card.question} ${card.answer} ${card.issue.join(' ')}`.toLowerCase();
-    return merged.includes(keyword);
-  });
-
-  visible.forEach((card, index) => {
-    const tr = document.createElement('tr');
-    if (card.issue.length > 0) {
-      tr.classList.add('issue-row');
-    }
-
-    tr.innerHTML = `
-      <td>${index + 1}</td>
-      <td><input type="text" data-field="page" value="${escapeHTML(card.page)}" /></td>
-      <td><textarea data-field="question">${escapeHTML(card.question)}</textarea></td>
-      <td><textarea data-field="answer">${escapeHTML(card.answer)}</textarea></td>
-      <td><input type="number" data-field="confidence" min="0" max="1" step="0.01" value="${Number(card.confidence).toFixed(2)}" /></td>
-      <td>
-        <input type="text" data-field="issue" value="${escapeHTML(card.issue.join(', '))}" />
-        <div>${card.issue.map((label) => `<span class="issue-badge">${escapeHTML(label)}</span>`).join('')}</div>
-      </td>
-      <td><button type="button" class="delete-btn">削除</button></td>
-    `;
-
-    tr.querySelectorAll('[data-field]').forEach((input) => {
-      input.addEventListener('input', () => {
-        const field = input.dataset.field;
-        if (field === 'confidence') {
-          card.confidence = Math.max(0, Math.min(1, Number(input.value || 0)));
-        } else if (field === 'issue') {
-          card.issue = String(input.value)
-            .split(',')
-            .map((x) => x.trim())
-            .filter(Boolean);
-        } else {
-          card[field] = input.value;
-        }
-        updateSummary();
-      });
-    });
-
-    tr.querySelector('.delete-btn').addEventListener('click', () => {
-      const idx = cards.indexOf(card);
-      if (idx >= 0) {
-        cards.splice(idx, 1);
-      }
-      renderTable();
-      updateSummary();
-    });
-
-    tableBody.appendChild(tr);
-  });
-}
-
-function updateSummary(extra = '') {
-  const issueCount = cards.filter((c) => c.issue.length > 0).length;
-  summary.textContent = `${cards.length}件 / issueあり ${issueCount}件${extra ? ` / ${extra}` : ''}`;
-}
-
-function csvEscape(value) {
-  const text = String(value ?? '');
-  if (/[";\n\r]/.test(text)) {
-    return `"${text.replaceAll('"', '""')}"`;
-  }
-  return text;
-}
-
-function exportCSV() {
-  const lines = cards.map((card) => `${csvEscape(card.question)};${csvEscape(card.answer)}`);
-  const blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
-  downloadBlob(blob, 'cards.csv');
-}
-
-function exportJSON() {
-  const blob = new Blob([JSON.stringify(cards, null, 2)], { type: 'application/json;charset=utf-8' });
-  downloadBlob(blob, 'cards.json');
-}
-
-function downloadBlob(blob, filename) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
-function stopPolling() {
-  if (pollTimer) {
-    clearTimeout(pollTimer);
-    pollTimer = null;
-  }
-}
-
-async function submitChunkAction(action) {
-  if (!currentJobId) {
-    return;
-  }
-  const normalized = String(action || '').trim().toLowerCase();
-  if (normalized !== 'retry' && normalized !== 'skip') {
-    return;
-  }
-
-  setChunkActionControls(true, true);
-  setStatus(`操作を送信中: ${normalized}`);
-
-  try {
-    const res = await fetch(`/api/jobs/${currentJobId}/action`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: normalized }),
-    });
-    const data = await res.json();
-    const snapshot = data?.job || null;
-    if (!res.ok && !snapshot) {
-      const code = data?.error?.code ? `[${data.error.code}] ` : '';
-      throw new Error(`${code}${data?.error?.message || '操作に失敗しました'}`);
-    }
-    const accepted = Boolean(data?.accepted);
-    if (snapshot) {
-      syncGeminiConsole(snapshot.logs);
-      setProgress(snapshot.completedChunks || 0, snapshot.totalChunks || 0);
-      renderActive(Array.isArray(snapshot.activeChunks) ? snapshot.activeChunks : []);
-    }
-    if (!accepted) {
-      setStatus(`操作は受け付けられませんでした: ${normalized}`);
-      setChunkActionControls(snapshot?.status === 'paused', false);
-      pollTimer = setTimeout(() => pollJob(currentJobId), 150);
-      return;
-    }
-    setStatus(`操作を受け付けました: ${normalized}`);
-    pollTimer = setTimeout(() => pollJob(currentJobId), 100);
-  } catch (err) {
-    setChunkActionControls(true, false);
-    setStatus(`操作エラー: ${err.message}`);
-  }
-}
-
-async function pollJob(jobId) {
-  try {
-    const res = await fetch(`/api/jobs/${jobId}`);
-    const data = await res.json();
-
-    if (!res.ok) {
-      const code = data?.error?.code ? `[${data.error.code}] ` : '';
-      throw new Error(`${code}${data?.error?.message || 'ジョブ取得に失敗しました'}`);
-    }
-
-    const total = data.totalChunks || 0;
-    const completed = data.completedChunks || 0;
-    setProgress(completed, total);
-    renderActive(Array.isArray(data.activeChunks) ? data.activeChunks : []);
-    syncGeminiConsole(data.logs);
-
-    if (data.status === 'queued') {
-      setStatus('ジョブをキューに登録しました...');
-      const detail = buildJobDetail(data);
-      setStatusDetail(detail);
-      setStopButton(true, false);
-      setChunkActionControls(false, true);
-      pollTimer = setTimeout(() => pollJob(jobId), POLL_IDLE_MS);
-      return;
-    }
-
-    if (data.status === 'running') {
-      setStatus('Geminiでカードを生成中です...');
-      setStatusDetail(buildJobDetail(data));
-      setStopButton(true, false);
-      setChunkActionControls(false, true);
-      pollTimer = setTimeout(() => pollJob(jobId), POLL_ACTIVE_MS);
-      return;
-    }
-
-    if (data.status === 'paused') {
-      setStatus('チャンク処理エラーで一時停止中です。リトライまたはスキップを選択してください。');
-      setStatusDetail(buildJobDetail(data));
-      setStopButton(true, false);
-      setChunkActionControls(true, false);
-      pollTimer = setTimeout(() => pollJob(jobId), POLL_IDLE_MS);
-      return;
-    }
-
-    if (data.status === 'stopping') {
-      setStatus('停止処理中です...');
-      setStatusDetail(buildJobDetail(data));
-      setStopButton(true, true);
-      setChunkActionControls(false, true);
-      pollTimer = setTimeout(() => pollJob(jobId), POLL_ACTIVE_MS);
-      return;
-    }
-
-    if (data.status === 'stopped') {
-      stopPolling();
-      startBtn.disabled = false;
-      setStopButton(false, true);
-      setChunkActionControls(false, true);
-      setStatus('停止しました。');
-      setStatusDetail(buildJobDetail(data));
-      return;
-    }
-
-    if (data.status === 'failed') {
-      stopPolling();
-      startBtn.disabled = false;
-      setStopButton(false, true);
-      setChunkActionControls(false, true);
-      setStatus('失敗しました。詳細を確認してください。');
-      setStatusDetail(buildJobDetail(data) || String(data.error || 'unknown error'));
-      return;
-    }
-
-    if (data.status === 'completed') {
-      stopPolling();
-      startBtn.disabled = false;
-      setStopButton(false, true);
-      setChunkActionControls(false, true);
-      setStatus('完了しました。テーブルで内容を修正できます。');
-      setStatusDetail(buildJobDetail(data));
-      cards = Array.isArray(data.cards) ? data.cards.map(normalizeCard) : [];
-      resultCard.hidden = false;
-      renderTable();
-      const warning = Array.isArray(data.warnings) && data.warnings.length > 0
-        ? `警告 ${data.warnings.length}件（失敗チャンク: ${(data.failedChunks || []).join(', ') || 'なし'}）`
-        : '';
-      updateSummary(warning);
-      return;
-    }
-
-    pollTimer = setTimeout(() => pollJob(jobId), POLL_IDLE_MS);
-  } catch (err) {
-    stopPolling();
-    startBtn.disabled = false;
-    setStopButton(false, true);
-    setChunkActionControls(false, true);
-    setStatus(`エラー: ${err.message}`);
-    setStatusDetail(String(err.message || err));
-  }
-}
-
-form.addEventListener('submit', async (event) => {
-  event.preventDefault();
-
-  stopPolling();
-  currentJobId = '';
-  cards = [];
-  resultCard.hidden = true;
-  resetGeminiConsole();
-
-  const formData = new FormData(form);
-  startBtn.disabled = true;
-  setStopButton(false, true);
-  setChunkActionControls(false, true);
-  setStatus('ジョブ作成中...');
-  setStatusDetail('');
-  setProgress(0, 1);
-  renderActive([]);
-
-  try {
-    const res = await fetch('/api/jobs', {
-      method: 'POST',
-      body: formData,
-    });
-    const data = await res.json();
-
-    if (!res.ok) {
-      const code = data?.error?.code ? `[${data.error.code}] ` : '';
-      throw new Error(`${code}${data?.error?.message || 'ジョブ作成に失敗しました'}`);
-    }
-
-    currentJobId = data.jobId;
-    setStatus(`ジョブ開始: ${currentJobId}`);
-    setStopButton(true, false);
-    setChunkActionControls(false, true);
-    void pollJob(currentJobId);
-  } catch (err) {
-    startBtn.disabled = false;
-    setStopButton(false, true);
-    setChunkActionControls(false, true);
-    setStatus(`エラー: ${err.message}`);
-    setStatusDetail(String(err.message || err));
-  }
-});
-
-stopBtn.addEventListener('click', async () => {
-  if (!currentJobId || stopBtn.disabled) {
-    return;
-  }
-
-  stopBtn.disabled = true;
-  setStatus('停止要求を送信中...');
-
-  try {
-    const res = await fetch(`/api/jobs/${currentJobId}/stop`, { method: 'POST' });
-    const data = await res.json();
-    const snapshot = data?.job || null;
-    if (!res.ok && !snapshot) {
-      const code = data?.error?.code ? `[${data.error.code}] ` : '';
-      throw new Error(`${code}${data?.error?.message || '停止要求に失敗しました'}`);
-    }
-    if (snapshot) {
-      syncGeminiConsole(snapshot.logs);
-      setProgress(snapshot.completedChunks || 0, snapshot.totalChunks || 0);
-      renderActive(Array.isArray(snapshot.activeChunks) ? snapshot.activeChunks : []);
-    }
-    setStatus('停止要求を送信しました。停止まで少し待ってください。');
-    setStatusDetail(snapshot ? buildJobDetail(snapshot) : '');
-    setChunkActionControls(false, true);
-    pollTimer = setTimeout(() => pollJob(currentJobId), 120);
-  } catch (err) {
-    stopBtn.disabled = false;
-    setStatus(`停止要求エラー: ${err.message}`);
-  }
-});
-
-chunkRetryBtn.addEventListener('click', () => {
-  void submitChunkAction('retry');
-});
-
-chunkSkipBtn.addEventListener('click', () => {
-  void submitChunkAction('skip');
-});
-
-searchInput.addEventListener('input', renderTable);
-onlyIssues.addEventListener('change', renderTable);
-
-addRowBtn.addEventListener('click', () => {
-  cards.push({ page: '', question: '', answer: '', confidence: 1, issue: [] });
-  renderTable();
-  updateSummary();
-});
-
-exportCsvBtn.addEventListener('click', exportCSV);
-exportJsonBtn.addEventListener('click', exportJSON);
-
-sourceInput.addEventListener('change', () => {
+function handleSourceInputChange() {
   void handlePreviewFileChange();
-});
+}
 
-form.addEventListener('click', (event) => {
+function handleFormClick(event) {
   const helpBtn = event.target.closest('.help-btn');
   if (!helpBtn || !form.contains(helpBtn)) {
     return;
@@ -1458,22 +967,14 @@ form.addEventListener('click', (event) => {
     return;
   }
   window.alert(text);
-});
+}
 
-[rangesInput, stepInput, overlapInput].forEach((input) => {
-  input.addEventListener('input', schedulePreviewRefresh);
-  input.addEventListener('change', schedulePreviewRefresh);
-});
-
-previewToggleBtn.addEventListener('click', () => {
+function handlePreviewToggleClick() {
   const collapsed = previewCard.classList.contains('collapsed');
   setPreviewCollapsed(!collapsed);
-});
+}
 
-pagePrevBtn.addEventListener('click', () => movePreviewPage(-1));
-pageNextBtn.addEventListener('click', () => movePreviewPage(1));
-
-window.addEventListener('resize', () => {
+function handleWindowResize() {
   if (previewResizeTimer) {
     clearTimeout(previewResizeTimer);
   }
@@ -1483,18 +984,81 @@ window.addEventListener('resize', () => {
       void renderPreviewPage();
     }
   }, 140);
-});
+}
 
-window.addEventListener('beforeunload', () => {
+function handleWindowBeforeUnload() {
   resetPreviewFile();
+}
+
+const cardsController = createCardsController({
+  resultCard,
+  summary,
+  tableBody,
+  searchInput,
+  onlyIssues,
+  addRowBtn,
+  exportCsvBtn,
+  exportJsonBtn,
 });
 
-setProgress(0, 1);
-updateSummary();
-setupPreviewCollapsedState();
-resetPreviewFile();
-setStopButton(false, true);
-setChunkActionControls(false, true);
-resetGeminiConsole();
+const jobsController = createJobsController({
+  form,
+  startBtn,
+  stopBtn,
+  chunkRetryBtn,
+  chunkSkipBtn,
+  pollActiveMs: POLL_ACTIVE_MS,
+  pollIdleMs: POLL_IDLE_MS,
+  setStatus,
+  setStatusDetail,
+  setStopButton,
+  setChunkActionControls,
+  setProgress,
+  renderActive,
+  resetGeminiConsole,
+  syncGeminiConsole,
+  resetResults: () => cardsController.reset(),
+  setResults: (cards, extra) => cardsController.setCards(cards, extra),
+});
 
-pdfPreviewReady = configurePdfJs();
+function bindPreviewEvents() {
+  sourceInput.addEventListener('change', handleSourceInputChange);
+  form.addEventListener('click', handleFormClick);
+
+  [rangesInput, stepInput, overlapInput].forEach((input) => {
+    input.addEventListener('input', schedulePreviewRefresh);
+    input.addEventListener('change', schedulePreviewRefresh);
+  });
+
+  previewToggleBtn.addEventListener('click', handlePreviewToggleClick);
+  pagePrevBtn.addEventListener('click', () => movePreviewPage(-1));
+  pageNextBtn.addEventListener('click', () => movePreviewPage(1));
+}
+
+function bindWindowEvents() {
+  window.addEventListener('resize', handleWindowResize);
+  window.addEventListener('beforeunload', handleWindowBeforeUnload);
+}
+
+function bindEventListeners() {
+  jobsController.bindEvents();
+  cardsController.bindEvents();
+  bindPreviewEvents();
+  bindWindowEvents();
+}
+
+function initializeUi() {
+  setProgress(0, 1);
+  cardsController.reset();
+  setupPreviewCollapsedState();
+  resetPreviewFile();
+  jobsController.initializeUi();
+}
+
+function initApp() {
+  bindEventListeners();
+  initializeUi();
+  pdfPreviewReady = configurePdfJs();
+}
+
+initApp();
