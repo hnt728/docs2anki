@@ -11,31 +11,59 @@ import (
 
 func parseProcessOptions(r *http.Request) (processOptions, error) {
 	opts := processOptions{
-		APIKey:         strings.TrimSpace(r.FormValue("apiKey")),
-		Model:          strings.TrimSpace(r.FormValue("model")),
-		Ranges:         strings.TrimSpace(r.FormValue("ranges")),
-		FrontPrompt:    strings.TrimSpace(r.FormValue("frontPrompt")),
-		BackPrompt:     strings.TrimSpace(r.FormValue("backPrompt")),
-		ThinkingBudget: 0,
+		Provider:              normalizeProvider(r.FormValue("provider")),
+		Ranges:                strings.TrimSpace(r.FormValue("ranges")),
+		FrontPrompt:           strings.TrimSpace(r.FormValue("frontPrompt")),
+		BackPrompt:            strings.TrimSpace(r.FormValue("backPrompt")),
+		ThinkingBudget:        0,
+		OpenAIReasoningEffort: defaultOpenAIReasoning,
 	}
 
-	if opts.Model == "" {
-		opts.Model = defaultModel
-	}
 	if opts.FrontPrompt == "" {
 		opts.FrontPrompt = "本文の要点から短い質問を作る"
 	}
 	if opts.BackPrompt == "" {
 		opts.BackPrompt = "質問に対する簡潔な答えを1-3文で"
 	}
-	if opts.APIKey == "" {
-		opts.APIKey = strings.TrimSpace(os.Getenv("GOOGLE_API_KEY"))
-	}
-	if opts.APIKey == "" {
-		opts.APIKey = strings.TrimSpace(os.Getenv("GEMINI_API_KEY"))
-	}
-	if opts.APIKey == "" {
-		return opts, fmt.Errorf("Gemini APIキーが未設定です（フォームまたは環境変数）")
+
+	switch opts.Provider {
+	case providerOpenAI:
+		opts.APIKey = firstNonEmpty(
+			r.FormValue("openaiApiKey"),
+			r.FormValue("apiKey"),
+			os.Getenv("OPENAI_API_KEY"),
+		)
+		opts.Model = firstNonEmpty(
+			r.FormValue("openaiModel"),
+			r.FormValue("model"),
+			defaultOpenAIModel,
+		)
+		if opts.APIKey == "" {
+			return opts, fmt.Errorf("OpenAI APIキーが未設定です（フォームまたは環境変数 OPENAI_API_KEY）")
+		}
+		effort, err := parseOpenAIReasoningEffort(r.FormValue("reasoningEffort"), defaultOpenAIReasoning)
+		if err != nil {
+			return opts, err
+		}
+		opts.OpenAIReasoningEffort = effort
+		opts.OpenAIImageDetailOriginal = parseBoolFormValue(r.FormValue("openaiImageDetailOriginal")) && isGPT54Model(opts.Model)
+	case providerGemini:
+		opts.APIKey = firstNonEmpty(
+			r.FormValue("geminiApiKey"),
+			r.FormValue("apiKey"),
+			os.Getenv("GOOGLE_API_KEY"),
+			os.Getenv("GEMINI_API_KEY"),
+		)
+		opts.Model = firstNonEmpty(
+			r.FormValue("geminiModel"),
+			r.FormValue("model"),
+			defaultGeminiModel,
+		)
+		if opts.APIKey == "" {
+			return opts, fmt.Errorf("Gemini APIキーが未設定です（フォームまたは環境変数 GOOGLE_API_KEY / GEMINI_API_KEY）")
+		}
+	default:
+		return opts, fmt.Errorf("未対応のAPIプロバイダです")
 	}
 
 	if opts.Ranges == "" {
@@ -56,9 +84,12 @@ func parseProcessOptions(r *http.Request) (processOptions, error) {
 	if err != nil || delayMS < 0 {
 		return opts, fmt.Errorf("delayMs は0以上で指定してください")
 	}
-	budget, err := parseIntFormValue(r.FormValue("thinkingBudget"), 0)
-	if err != nil || budget < -1 {
-		return opts, fmt.Errorf("thinkingBudget は -1 以上で指定してください")
+	if opts.Provider == providerGemini {
+		budget, err := parseIntFormValue(r.FormValue("thinkingBudget"), 0)
+		if err != nil || budget < -1 {
+			return opts, fmt.Errorf("thinkingBudget は -1 以上で指定してください")
+		}
+		opts.ThinkingBudget = budget
 	}
 	minConfidence, err := parseFloatFormValue(r.FormValue("minConfidence"), 0.7)
 	if err != nil {
@@ -72,9 +103,50 @@ func parseProcessOptions(r *http.Request) (processOptions, error) {
 	}
 
 	opts.DelayMS = delayMS
-	opts.ThinkingBudget = budget
 	opts.MinConfidence = minConfidence
 	return opts, nil
+}
+
+func normalizeProvider(value string) providerKind {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case string(providerOpenAI):
+		return providerOpenAI
+	default:
+		return providerGemini
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func parseBoolFormValue(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "on", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+func parseOpenAIReasoningEffort(value string, defaultValue string) (string, error) {
+	raw := strings.ToLower(strings.TrimSpace(value))
+	if raw == "" {
+		raw = strings.ToLower(strings.TrimSpace(defaultValue))
+	}
+	switch raw {
+	case "low", "medium", "high", "xhigh":
+		return raw, nil
+	case "extra_high", "extra-high", "extra high":
+		return "xhigh", nil
+	default:
+		return "", fmt.Errorf("reasoningEffort は low / medium / high / extra high のいずれかで指定してください")
+	}
 }
 
 func parseIntFormValue(value string, defaultValue int) (int, error) {

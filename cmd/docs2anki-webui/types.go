@@ -9,7 +9,9 @@ import (
 )
 
 const (
-	defaultModel            = "gemini-3-flash-preview"
+	defaultGeminiModel      = "gemini-3-flash-preview"
+	defaultOpenAIModel      = "gpt-5.4"
+	defaultOpenAIReasoning  = "medium"
 	defaultMaxChunkPDFBytes = int64(19 * 1024 * 1024) // warning threshold
 	optimizedSourceFileName = "source.optimized.pdf"
 	maxJobLogEntries        = 900
@@ -24,26 +26,68 @@ const (
 	sourceKindImage sourceKind = "image"
 )
 
+type providerKind string
+
+const (
+	providerGemini providerKind = "gemini"
+	providerOpenAI providerKind = "openai"
+)
+
+type issueDefinition struct {
+	Label       string
+	Description string
+}
+
+func buildIssueCatalog(defs []issueDefinition) []string {
+	labels := make([]string, 0, len(defs))
+	for _, def := range defs {
+		labels = append(labels, def.Label)
+	}
+	return labels
+}
+
+func buildIssueSet(defs []issueDefinition) map[string]struct{} {
+	set := make(map[string]struct{}, len(defs))
+	for _, def := range defs {
+		set[def.Label] = struct{}{}
+	}
+	return set
+}
+
 var (
 	//go:embed web/*
 	staticAssets embed.FS
 
-	issueCatalog = []string{
-		"page_number_missing",
-		"page_split",
-		"insufficient_context",
-		"unreadable_content",
-		"non_qa_content",
-		"other",
+	issueDefinitions = []issueDefinition{
+		{
+			Label:       "page_number_missing",
+			Description: "PDF/画像内に印字ページ番号があるはずだが、見えない、隠れている、反射している、荒い等の理由で読み取れない",
+		},
+		{
+			Label:       "page_split",
+			Description: "文章や表が途中で切れて読めない、またはチャンク境界で文脈が途切れて内容が不完全",
+		},
+		{
+			Label:       "unreadable_content",
+			Description: "レイアウト、画質、反射、欠け等の理由で本文や表の内容を読み取れない",
+		},
+		{
+			Label:       "non_qa_content",
+			Description: "Q&Aにするのに十分な情報がない、またはQ&A化に向かない内容",
+		},
+		{
+			Label:       "other",
+			Description: "上記に当てはまらない問題",
+		},
 	}
-	issueSet = map[string]struct{}{
-		"page_number_missing":  {},
-		"page_split":           {},
-		"insufficient_context": {},
-		"unreadable_content":   {},
-		"non_qa_content":       {},
-		"other":                {},
-		"low_confidence":       {},
+	issueCatalog = buildIssueCatalog(issueDefinitions)
+	issueSet     = func() map[string]struct{} {
+		set := buildIssueSet(issueDefinitions)
+		set["low_confidence"] = struct{}{}
+		return set
+	}()
+	legacyIssueAliases = map[string]string{
+		"insufficient_context": "non_qa_content",
 	}
 	allowedSourceMIMEs = map[string]sourceKind{
 		"application/pdf": sourceKindPDF,
@@ -73,16 +117,19 @@ type app struct {
 }
 
 type processOptions struct {
-	APIKey         string
-	Model          string
-	Ranges         string
-	Step           int
-	Overlap        int
-	FrontPrompt    string
-	BackPrompt     string
-	MinConfidence  float64
-	DelayMS        int
-	ThinkingBudget int
+	Provider                  providerKind
+	APIKey                    string
+	Model                     string
+	Ranges                    string
+	Step                      int
+	Overlap                   int
+	FrontPrompt               string
+	BackPrompt                string
+	MinConfidence             float64
+	DelayMS                   int
+	ThinkingBudget            int
+	OpenAIReasoningEffort     string
+	OpenAIImageDetailOriginal bool
 }
 
 type uploadedSource struct {
@@ -94,16 +141,19 @@ type uploadedSource struct {
 }
 
 type jobConfigSummary struct {
-	SourceType     string  `json:"sourceType"`
-	Model          string  `json:"model"`
-	Ranges         string  `json:"ranges"`
-	Step           int     `json:"step"`
-	Overlap        int     `json:"overlap"`
-	FrontPrompt    string  `json:"frontPrompt"`
-	BackPrompt     string  `json:"backPrompt"`
-	MinConfidence  float64 `json:"minConfidence"`
-	DelayMS        int     `json:"delayMs"`
-	ThinkingBudget int     `json:"thinkingBudget"`
+	Provider                  string  `json:"provider"`
+	SourceType                string  `json:"sourceType"`
+	Model                     string  `json:"model"`
+	Ranges                    string  `json:"ranges"`
+	Step                      int     `json:"step"`
+	Overlap                   int     `json:"overlap"`
+	FrontPrompt               string  `json:"frontPrompt"`
+	BackPrompt                string  `json:"backPrompt"`
+	MinConfidence             float64 `json:"minConfidence"`
+	DelayMS                   int     `json:"delayMs"`
+	ThinkingBudget            int     `json:"thinkingBudget"`
+	OpenAIReasoningEffort     string  `json:"openaiReasoningEffort,omitempty"`
+	OpenAIImageDetailOriginal bool    `json:"openaiImageDetailOriginal,omitempty"`
 }
 
 type Card struct {

@@ -109,16 +109,19 @@ func (a *app) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	currentJob := a.jobs.create(jobConfigSummary{
-		SourceType:     sourceType,
-		Model:          opts.Model,
-		Ranges:         opts.Ranges,
-		Step:           opts.Step,
-		Overlap:        opts.Overlap,
-		FrontPrompt:    opts.FrontPrompt,
-		BackPrompt:     opts.BackPrompt,
-		MinConfidence:  opts.MinConfidence,
-		DelayMS:        opts.DelayMS,
-		ThinkingBudget: opts.ThinkingBudget,
+		Provider:                  string(opts.Provider),
+		SourceType:                sourceType,
+		Model:                     opts.Model,
+		Ranges:                    opts.Ranges,
+		Step:                      opts.Step,
+		Overlap:                   opts.Overlap,
+		FrontPrompt:               opts.FrontPrompt,
+		BackPrompt:                opts.BackPrompt,
+		MinConfidence:             opts.MinConfidence,
+		DelayMS:                   opts.DelayMS,
+		ThinkingBudget:            opts.ThinkingBudget,
+		OpenAIReasoningEffort:     opts.OpenAIReasoningEffort,
+		OpenAIImageDetailOriginal: opts.OpenAIImageDetailOriginal,
 	})
 
 	go func(j *job, uploaded []uploadedSource, options processOptions) {
@@ -130,7 +133,7 @@ func (a *app) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 			j.clearCancel()
 		}()
 
-		j.appendLogf("system", "ジョブ開始: model=%s", options.Model)
+		j.appendLogf("system", "ジョブ開始: provider=%s model=%s", providerDisplayName(options.Provider), options.Model)
 
 		if err := runJob(ctx, j, uploaded, options); err != nil {
 			if errors.Is(err, context.Canceled) && j.isStopRequested() {

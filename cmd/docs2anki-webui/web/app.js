@@ -45,6 +45,7 @@ const tableBody = document.querySelector('#cards-table tbody');
 const searchInput = document.getElementById('search');
 const onlyIssues = document.getElementById('only-issues');
 const addRowBtn = document.getElementById('add-row');
+const exportEscapeInput = document.getElementById('export-escape');
 const exportCsvBtn = document.getElementById('export-csv');
 const exportJsonBtn = document.getElementById('export-json');
 
@@ -52,6 +53,13 @@ const sourceInput = form.querySelector('input[name="source"]');
 const rangesInput = form.querySelector('input[name="ranges"]');
 const stepInput = form.querySelector('input[name="step"]');
 const overlapInput = form.querySelector('input[name="overlap"]');
+const helpButtons = Array.from(form.querySelectorAll('.help-btn'));
+const providerInputs = Array.from(form.querySelectorAll('input[name="provider"]'));
+const geminiPanel = document.getElementById('provider-panel-gemini');
+const openaiPanel = document.getElementById('provider-panel-openai');
+const openaiModelInput = form.querySelector('input[name="openaiModel"]');
+const openaiDetailOriginalRow = document.getElementById('openai-detail-original-row');
+const openaiDetailOriginalInput = form.querySelector('input[name="openaiImageDetailOriginal"]');
 
 const previewCard = document.getElementById('preview-card');
 const previewToggleBtn = document.getElementById('preview-toggle');
@@ -73,11 +81,13 @@ const POLL_ACTIVE_MS = 550;
 const POLL_IDLE_MS = 900;
 const settingHelpTexts = Object.freeze({
   ranges: 'ページ範囲: 処理対象のページ(または画像番号)です。例: 1-12, 5, 8-10',
-  step: 'Step: ページ範囲のページを分割した、1チャンクに含めるページ数です。例: step=3 なら 1-3, 4-6, 7-9 ...を1チャンク(1まとまり)としてGemini APIで処理します。',
+  step: 'Step: ページ範囲のページを分割した、1チャンクに含めるページ数です。例: step=3 なら 1-3, 4-6, 7-9 ...を1チャンク(1まとまり)として選択中のAPIで処理します。',
   overlap: 'Overlap: チャンク同士で重複させるページ数です。0以上かつ Step 未満で指定します。例: step=3, overlap=1 なら 1-3, 3-5, 5-7 ...',
   minConfidence: 'Min Confidence: この値未満のカードに low_confidence を付けます。値は 0.0 から 1.0 です。',
   delayMs: 'Delay(ms): 各APIリクエスト前に待つ時間(ミリ秒)です。レート制限が厳しいときに増やします。0以上で指定します。',
   thinkingBudget: 'Thinking Budget: Geminiの思考予算です。-1 は動的、0以上は予算指定です。モデルやAPIバージョンによって実際の挙動は異なる場合があります。',
+  reasoningEffort: 'Reasoning Effort: OpenAIの推論量です。low / medium / high / extra high から選びます。高いほど複数箇所の照合や構造理解に有利ですが、遅く高コストになりやすいです。',
+  openAIDetailOriginal: 'detail="original": OpenAI gpt-5.4系の画像入力で解像度を上げる設定です。小さい文字・手書き・低品質スキャンに有利ですが、トークン消費は増えます。PDF入力には適用されません。',
 });
 
 let latestLogSeq = 0;
@@ -219,6 +229,51 @@ function parseStepOverlap() {
   }
 
   return { step, overlap };
+}
+
+function getSelectedProvider() {
+  const selected = providerInputs.find((input) => input.checked);
+  return selected?.value === 'openai' ? 'openai' : 'gemini';
+}
+
+function isGPT54Model(value) {
+  return String(value || '').trim().toLowerCase().startsWith('gpt-5.4');
+}
+
+function setSectionVisibility(section, visible) {
+  if (!section) {
+    return;
+  }
+
+  section.hidden = !visible;
+  section.setAttribute('aria-hidden', visible ? 'false' : 'true');
+
+  section.querySelectorAll('input, select, textarea, button').forEach((control) => {
+    if (!visible) {
+      if (!control.disabled) {
+        control.disabled = true;
+        control.dataset.hiddenDisabled = 'true';
+      }
+      return;
+    }
+
+    if (control.dataset.hiddenDisabled === 'true') {
+      control.disabled = false;
+      delete control.dataset.hiddenDisabled;
+    }
+  });
+}
+
+function syncProviderFields() {
+  const provider = getSelectedProvider();
+  setSectionVisibility(geminiPanel, provider === 'gemini');
+  setSectionVisibility(openaiPanel, provider === 'openai');
+
+  const showOriginal = provider === 'openai' && isGPT54Model(openaiModelInput?.value);
+  setSectionVisibility(openaiDetailOriginalRow, showOriginal);
+  if (!showOriginal && openaiDetailOriginalInput) {
+    openaiDetailOriginalInput.checked = false;
+  }
 }
 
 function getSourceKind(file) {
@@ -954,13 +1009,10 @@ function handleSourceInputChange() {
   void handlePreviewFileChange();
 }
 
-function handleFormClick(event) {
-  const helpBtn = event.target.closest('.help-btn');
-  if (!helpBtn || !form.contains(helpBtn)) {
-    return;
-  }
+function handleHelpButtonClick(event) {
   event.preventDefault();
   event.stopPropagation();
+  const helpBtn = event.currentTarget;
   const key = String(helpBtn.dataset.helpKey || '').trim();
   const text = settingHelpTexts[key];
   if (!text) {
@@ -997,6 +1049,7 @@ const cardsController = createCardsController({
   searchInput,
   onlyIssues,
   addRowBtn,
+  exportEscapeInput,
   exportCsvBtn,
   exportJsonBtn,
 });
@@ -1023,7 +1076,16 @@ const jobsController = createJobsController({
 
 function bindPreviewEvents() {
   sourceInput.addEventListener('change', handleSourceInputChange);
-  form.addEventListener('click', handleFormClick);
+  helpButtons.forEach((button) => {
+    button.addEventListener('click', handleHelpButtonClick);
+  });
+  providerInputs.forEach((input) => {
+    input.addEventListener('change', syncProviderFields);
+  });
+  if (openaiModelInput) {
+    openaiModelInput.addEventListener('input', syncProviderFields);
+    openaiModelInput.addEventListener('change', syncProviderFields);
+  }
 
   [rangesInput, stepInput, overlapInput].forEach((input) => {
     input.addEventListener('input', schedulePreviewRefresh);
@@ -1050,6 +1112,7 @@ function bindEventListeners() {
 function initializeUi() {
   setProgress(0, 1);
   cardsController.reset();
+  syncProviderFields();
   setupPreviewCollapsedState();
   resetPreviewFile();
   jobsController.initializeUi();

@@ -10,49 +10,118 @@
   <main class="page">
     <section class="hero card">
       <h1>docs2anki</h1>
-      <p>PDF/画像をGeminiで一問一答カード化し、画面上で修正してCSV出力できます。</p>
+      <p>PDF/画像をGeminiまたはOpenAIで一問一答カード化し、画面上で修正してCSV出力できます。</p>
     </section>
 
     <section class="split-layout">
       <section class="card">
         <h2>生成設定</h2>
         <form id="job-form" class="grid">
-          <label>
-            <span>Gemini API Key</span>
-            <input type="password" name="apiKey" placeholder="空欄なら環境変数を使用" />
-          </label>
-          <label>
-            <span>Model</span>
-            <input type="text" name="model" value="gemini-3-flash-preview" />
-          </label>
+          <div class="full provider-switch">
+            <span>API Provider</span>
+            <div class="provider-toggle" role="radiogroup" aria-label="API Provider">
+              <label class="provider-pill">
+                <input type="radio" name="provider" value="gemini" checked />
+                <span>Gemini</span>
+              </label>
+              <label class="provider-pill">
+                <input type="radio" name="provider" value="openai" />
+                <span>OpenAI</span>
+              </label>
+            </div>
+          </div>
+          <div class="full provider-panel" id="provider-panel-gemini">
+            <div class="provider-panel-grid">
+              <label>
+                <span>Gemini API Key</span>
+                <input type="password" name="geminiApiKey" placeholder="空欄なら環境変数を使用" />
+              </label>
+              <label>
+                <span>Model</span>
+                <input type="text" name="geminiModel" value="gemini-3-flash-preview" />
+              </label>
+              <div class="field">
+                <div class="field-label-row">
+                  <label for="thinking-budget" class="field-label">Thinking Budget</label>
+                  <button type="button" class="help-btn" data-help-key="thinkingBudget" aria-label="Thinking Budgetの説明を表示" title="Thinking Budgetの説明">?</button>
+                </div>
+                <input id="thinking-budget" type="number" name="thinkingBudget" value="0" min="-1" />
+              </div>
+            </div>
+          </div>
+          <div class="full provider-panel" id="provider-panel-openai" hidden>
+            <div class="provider-panel-grid">
+              <label>
+                <span>OpenAI API Key</span>
+                <input type="password" name="openaiApiKey" placeholder="空欄なら環境変数 OPENAI_API_KEY を使用" />
+              </label>
+              <label>
+                <span>Model</span>
+                <input type="text" name="openaiModel" value="gpt-5.4" />
+              </label>
+              <div class="field">
+                <div class="field-label-row">
+                  <label for="openai-reasoning-effort" class="field-label">Reasoning Effort</label>
+                  <button type="button" class="help-btn" data-help-key="reasoningEffort" aria-label="Reasoning Effortの説明を表示" title="Reasoning Effortの説明">?</button>
+                </div>
+                <select id="openai-reasoning-effort" name="reasoningEffort">
+                  <option value="low">low</option>
+                  <option value="medium" selected>medium</option>
+                  <option value="high">high</option>
+                  <option value="xhigh">extra high</option>
+                </select>
+              </div>
+              <div class="full setting-check field" id="openai-detail-original-row" hidden>
+                <div class="field-label-row">
+                  <label for="openai-image-detail-original" class="field-label">detail=&quot;original&quot;</label>
+                  <button type="button" class="help-btn" data-help-key="openAIDetailOriginal" aria-label="detail originalの説明を表示" title="detail originalの説明">?</button>
+                </div>
+                <label class="setting-check-input" for="openai-image-detail-original">
+                  <input id="openai-image-detail-original" type="checkbox" name="openaiImageDetailOriginal" />
+                  <span>gpt-5.4系で画像認識を優先する</span>
+                </label>
+              </div>
+            </div>
+          </div>
           <label class="full">
             <span>入力ファイル（PDF / 画像）</span>
             <input type="file" name="source" accept="application/pdf,image/png,image/jpeg,image/webp,image/gif,image/bmp,image/tiff" multiple required />
           </label>
-          <label>
-            <span class="label-with-help">ページ範囲 <button type="button" class="help-btn" data-help-key="ranges" aria-label="ページ範囲の説明を表示" title="ページ範囲の説明">?</button></span>
-            <input type="text" name="ranges" value="1-10" required />
-          </label>
-          <label>
-            <span class="label-with-help">Step <button type="button" class="help-btn" data-help-key="step" aria-label="Stepの説明を表示" title="Stepの説明">?</button></span>
-            <input type="number" name="step" value="1" min="1" />
-          </label>
-          <label>
-            <span class="label-with-help">Overlap <button type="button" class="help-btn" data-help-key="overlap" aria-label="Overlapの説明を表示" title="Overlapの説明">?</button></span>
-            <input type="number" name="overlap" value="0" min="0" />
-          </label>
-          <label>
-            <span class="label-with-help">Min Confidence <button type="button" class="help-btn" data-help-key="minConfidence" aria-label="Min Confidenceの説明を表示" title="Min Confidenceの説明">?</button></span>
-            <input type="number" name="minConfidence" value="0.7" min="0" max="1" step="0.05" />
-          </label>
-          <label>
-            <span class="label-with-help">Delay(ms) <button type="button" class="help-btn" data-help-key="delayMs" aria-label="Delayの説明を表示" title="Delayの説明">?</button></span>
-            <input type="number" name="delayMs" value="0" min="0" />
-          </label>
-          <label>
-            <span class="label-with-help">Thinking Budget <button type="button" class="help-btn" data-help-key="thinkingBudget" aria-label="Thinking Budgetの説明を表示" title="Thinking Budgetの説明">?</button></span>
-            <input type="number" name="thinkingBudget" value="0" min="-1" />
-          </label>
+          <div class="field">
+            <div class="field-label-row">
+              <label for="page-ranges" class="field-label">ページ範囲</label>
+              <button type="button" class="help-btn" data-help-key="ranges" aria-label="ページ範囲の説明を表示" title="ページ範囲の説明">?</button>
+            </div>
+            <input id="page-ranges" type="text" name="ranges" value="1-10" required />
+          </div>
+          <div class="field">
+            <div class="field-label-row">
+              <label for="page-step" class="field-label">Step</label>
+              <button type="button" class="help-btn" data-help-key="step" aria-label="Stepの説明を表示" title="Stepの説明">?</button>
+            </div>
+            <input id="page-step" type="number" name="step" value="1" min="1" />
+          </div>
+          <div class="field">
+            <div class="field-label-row">
+              <label for="page-overlap" class="field-label">Overlap</label>
+              <button type="button" class="help-btn" data-help-key="overlap" aria-label="Overlapの説明を表示" title="Overlapの説明">?</button>
+            </div>
+            <input id="page-overlap" type="number" name="overlap" value="0" min="0" />
+          </div>
+          <div class="field">
+            <div class="field-label-row">
+              <label for="min-confidence" class="field-label">Min Confidence</label>
+              <button type="button" class="help-btn" data-help-key="minConfidence" aria-label="Min Confidenceの説明を表示" title="Min Confidenceの説明">?</button>
+            </div>
+            <input id="min-confidence" type="number" name="minConfidence" value="0.7" min="0" max="1" step="0.05" />
+          </div>
+          <div class="field">
+            <div class="field-label-row">
+              <label for="delay-ms" class="field-label">Delay(ms)</label>
+              <button type="button" class="help-btn" data-help-key="delayMs" aria-label="Delayの説明を表示" title="Delayの説明">?</button>
+            </div>
+            <input id="delay-ms" type="number" name="delayMs" value="0" min="0" />
+          </div>
           <label class="full">
             <span>Front生成指示</span>
             <input type="text" name="frontPrompt" value="本文の要点から短い質問を作る" />
@@ -121,7 +190,7 @@
       <div id="active-chunks" class="chips"></div>
       <details id="gemini-console-box" class="console-box">
         <summary>
-          <span>Gemini Console</span>
+          <span>Model Console</span>
           <span id="gemini-console-count" class="console-count">0行</span>
         </summary>
         <pre id="gemini-console" class="console-output"></pre>
@@ -135,6 +204,7 @@
           <input type="search" id="search" placeholder="検索（問題・解答・page）" />
           <label class="inline-check"><input type="checkbox" id="only-issues" /> issueのみ</label>
           <button type="button" id="add-row">行を追加</button>
+          <label class="inline-check"><input type="checkbox" id="export-escape" checked /> &quot; ; \ などをエスケープ</label>
           <button type="button" id="export-csv">CSVエクスポート</button>
           <button type="button" id="export-json">JSONエクスポート</button>
         </div>

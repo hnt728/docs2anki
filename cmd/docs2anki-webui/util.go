@@ -120,6 +120,19 @@ func contains(list []string, target string) bool {
 	return false
 }
 
+func providerDisplayName(provider providerKind) string {
+	switch provider {
+	case providerOpenAI:
+		return "OpenAI"
+	default:
+		return "Gemini"
+	}
+}
+
+func isGPT54Model(model string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "gpt-5.4")
+}
+
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)

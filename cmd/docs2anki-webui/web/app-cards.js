@@ -16,6 +16,7 @@
     searchInput,
     onlyIssues,
     addRowBtn,
+    exportEscapeInput,
     exportCsvBtn,
     exportJsonBtn,
   }) {
@@ -102,14 +103,63 @@
       URL.revokeObjectURL(url);
     }
 
+    function shouldEscapeExports() {
+      return !exportEscapeInput || exportEscapeInput.checked;
+    }
+
+    function serializeExportJSONValue(value, indentLevel = 0, escapeStrings = true) {
+      if (Array.isArray(value)) {
+        if (value.length === 0) {
+          return '[]';
+        }
+        const indent = '  '.repeat(indentLevel);
+        const childIndent = '  '.repeat(indentLevel + 1);
+        return `[\n${value.map((item) => `${childIndent}${serializeExportJSONValue(item, indentLevel + 1, escapeStrings)}`).join(',\n')}\n${indent}]`;
+      }
+
+      if (value && typeof value === 'object') {
+        const entries = Object.entries(value);
+        if (entries.length === 0) {
+          return '{}';
+        }
+        const indent = '  '.repeat(indentLevel);
+        const childIndent = '  '.repeat(indentLevel + 1);
+        return `{\n${entries.map(([key, item]) => `${childIndent}${JSON.stringify(key)}: ${serializeExportJSONValue(item, indentLevel + 1, escapeStrings)}`).join(',\n')}\n${indent}}`;
+      }
+
+      if (typeof value === 'string') {
+        return escapeStrings ? JSON.stringify(value) : `"${String(value)}"`;
+      }
+
+      if (typeof value === 'number') {
+        return Number.isFinite(value) ? String(value) : 'null';
+      }
+
+      if (typeof value === 'boolean') {
+        return value ? 'true' : 'false';
+      }
+
+      if (value == null) {
+        return 'null';
+      }
+
+      return escapeStrings ? JSON.stringify(value) : `"${String(value)}"`;
+    }
+
     function exportCSV() {
-      const lines = cards.map((card) => `${csvEscape(card.question)};${csvEscape(card.answer)}`);
+      const escapeStrings = shouldEscapeExports();
+      const lines = cards.map((card) => {
+        const question = escapeStrings ? csvEscape(card.question) : String(card.question ?? '');
+        const answer = escapeStrings ? csvEscape(card.answer) : String(card.answer ?? '');
+        return `${question};${answer}`;
+      });
       const blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
       downloadBlob(blob, 'cards.csv');
     }
 
     function exportJSON() {
-      const blob = new Blob([JSON.stringify(cards, null, 2)], { type: 'application/json;charset=utf-8' });
+      const body = serializeExportJSONValue(cards, 0, shouldEscapeExports());
+      const blob = new Blob([body], { type: 'application/json;charset=utf-8' });
       downloadBlob(blob, 'cards.json');
     }
 

@@ -31,6 +31,10 @@
     let pollTimer = null;
     let currentJobId = '';
 
+    function providerName(data = {}) {
+      return String(data?.config?.provider || '').trim().toLowerCase() === 'openai' ? 'OpenAI' : 'Gemini';
+    }
+
     function stopPolling() {
       if (pollTimer) {
         clearTimeout(pollTimer);
@@ -59,6 +63,12 @@
       }
       if (data.status) {
         lines.push(`status: ${data.status}`);
+      }
+      if (data?.config?.provider) {
+        lines.push(`provider: ${providerName(data)}`);
+      }
+      if (data?.config?.model) {
+        lines.push(`model: ${String(data.config.model)}`);
       }
       if (Array.isArray(data.failedChunks) && data.failedChunks.length > 0) {
         lines.push(`failed chunks: ${data.failedChunks.join(', ')}`);
@@ -152,7 +162,7 @@
         }
 
         if (data.status === 'running') {
-          setStatus('Geminiでカードを生成中です...');
+          setStatus(`${providerName(data)}でカードを生成中です...`);
           setStatusDetail(buildJobDetail(data));
           setStopButton(true, false);
           setChunkActionControls(false, true);

@@ -3,6 +3,7 @@ module docs2anki/webui
 go 1.26
 
 require (
+	github.com/openai/openai-go/v3 v3.26.0
 	github.com/pdfcpu/pdfcpu v0.11.1
 	google.golang.org/genai v1.47.0
 )
@@ -22,6 +23,10 @@ require (
 	github.com/hhrutter/tiff v1.0.2 // indirect
 	github.com/mattn/go-runewidth v0.0.19 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
+	github.com/tidwall/gjson v1.18.0 // indirect
+	github.com/tidwall/match v1.1.1 // indirect
+	github.com/tidwall/pretty v1.2.1 // indirect
+	github.com/tidwall/sjson v1.2.5 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	golang.org/x/crypto v0.43.0 // indirect
 	golang.org/x/image v0.32.0 // indirect

@@ -2,7 +2,7 @@
 
 English README: [README.md](./README.md)
 
-`docs2anki` は、PDFページまたは画像をGeminiで一問一答カード化し、Anki向けにエクスポートできるツールです。
+`docs2anki` は、PDFページまたは画像をGeminiまたはOpenAIで一問一答カード化し、Anki向けにエクスポートできるツールです。
 
 ## 主な機能
 
@@ -21,7 +21,7 @@ Releaseバイナリを使う場合、Goは不要です。
 1. GitHub ReleasesからOS/アーキテクチャに合ったバイナリをダウンロード
 2. バイナリを実行
 3. `http://localhost:8080` を開く
-4. Gemini APIキーをフォームに入力、または `GOOGLE_API_KEY` / `GEMINI_API_KEY` を設定
+4. Gemini APIキーまたはOpenAI APIキーをフォームに入力
 
 ## ソースから起動
 
@@ -35,6 +35,7 @@ go run ./cmd/docs2anki-webui
 
 - Go `1.26` 以上
 - Gemini APIキー（`GOOGLE_API_KEY` または `GEMINI_API_KEY`、またはフォーム入力）
+- または OpenAI APIキー（`OPENAI_API_KEY`、またはフォーム入力）
 
 ## ビルド
 
@@ -64,4 +65,5 @@ cd docs2anki
 - UI文言は現在日本語です。
 - PDFプレビューはCDN経由の `pdf.js` を使うため、PDFプレビュー表示にはネットワーク接続が必要です。
 - 画像入力では各画像が1ページとして扱われ、`ranges` / `step` / `overlap` でチャンク分割されます。
+- OpenAIの `detail="original"` は画像入力時のみ適用され、PDF入力では `input_file` として送信されます。
 - 処理は非同期ジョブとして実行されます（`/api/jobs`, `/api/jobs/{jobId}`）。
