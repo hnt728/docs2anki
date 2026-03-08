@@ -1,29 +1,29 @@
 # docs2anki
 
-日本語はこちら: [README.ja.md](./README.ja.md)
+English README: [README.en.md](./README.en.md)
 
-`docs2anki` converts uploaded PDF pages or images into Q&A flashcards with Gemini or OpenAI and lets you review and export the results for Anki.
+`docs2anki` は、PDFページまたは画像をGeminiまたはOpenAIで一問一答カード化し、Anki向けにエクスポートできるツールです。
 
-## Features
+## 主な機能
 
-- Upload one PDF or multiple images and generate cards
-- Configure chunking with `ranges`, `step`, and `overlap`
-- Preview pages/chunks for both PDF and image uploads before processing
-- Track job progress, warnings, and failed chunks
-- Review and edit generated cards directly in the browser
-- Export `cards.csv` in `Front;Back` format (no header)
-- Export `cards.json` with `page`, `question`, `answer`, `confidence`, and `issue`
+- 1つのPDFまたは複数画像をアップロードしてカードを生成
+- `ranges` / `step` / `overlap` でチャンク分割を調整
+- 実行前にPDF/画像ともページとチャンク境界をプレビュー
+- 進捗、警告、失敗チャンクをUI上で確認
+- 生成後のカードをブラウザ上で編集
+- `Front;Back`（ヘッダなし）の `cards.csv` をエクスポート
+- `page` / `question` / `answer` / `confidence` / `issue` を含む `cards.json` をエクスポート
 
-## Use prebuilt binary (GitHub Releases)
+## GitHub Releases のバイナリを使う
 
-Go is not required when you use release binaries.
+Releaseバイナリを使う場合、Goは不要です。
 
-1. Download the binary for your OS/architecture from GitHub Releases.
-2. Run it.
-3. Open `http://localhost:8080`.
-4. Enter your Gemini or OpenAI API key in the form.
+1. GitHub ReleasesからOS/アーキテクチャに合ったバイナリをダウンロード
+2. バイナリを実行
+3. `http://localhost:8080` を開く
+4. Gemini APIキーまたはOpenAI APIキーをフォームに入力
 
-## Build from source
+## ソースから起動
 
 ```bash
 cd docs2anki
@@ -31,39 +31,39 @@ go mod tidy
 go run ./cmd/docs2anki-webui
 ```
 
-Source build requirements:
+ソース実行時の前提:
 
-- Go `1.26` or later
-- Gemini API key (`GOOGLE_API_KEY` or `GEMINI_API_KEY`, or form input)
-- or OpenAI API key (`OPENAI_API_KEY`, or form input)
+- Go `1.26` 以上
+- Gemini APIキー（`GOOGLE_API_KEY` または `GEMINI_API_KEY`、またはフォーム入力）
+- または OpenAI APIキー（`OPENAI_API_KEY`、またはフォーム入力）
 
-## Build a binary
+## ビルド
 
 ```bash
 cd docs2anki
 go build -trimpath -ldflags "-s -w" -o dist/docs2anki-webui ./cmd/docs2anki-webui
 ```
 
-## Cross-platform builds
+## クロスプラットフォームビルド
 
-Use the helper script:
+補助スクリプトを使う場合:
 
 ```bash
 cd docs2anki
 ./build-cross.sh
 ```
 
-Or build manually with `GOOS`/`GOARCH`.
+または `GOOS` / `GOARCH` を指定して手動でビルドできます。
 
-## Server flags
+## サーバーフラグ
 
-- `-addr` (default: `:8080`): HTTP listen address
-- `-max-upload-mb` (default: `300`): max upload size
+- `-addr`（デフォルト: `:8080`）: HTTP待受アドレス
+- `-max-upload-mb`（デフォルト: `300`）: アップロード上限サイズ
 
-## Notes
+## 補足
 
-- The UI text is currently in Japanese.
-- PDF preview uses `pdf.js` from a CDN, so PDF preview rendering requires network access.
-- For image uploads, each image is treated as a page and chunked by `ranges` / `step` / `overlap`.
-- OpenAI `detail="original"` is applied only to image inputs; PDF uploads are sent as `input_file`.
-- Processing runs as async jobs (`/api/jobs` and `/api/jobs/{jobId}`).
+- UI文言は現在日本語です。
+- PDFプレビューはCDN経由の `pdf.js` を使うため、PDFプレビュー表示にはネットワーク接続が必要です。
+- 画像入力では各画像が1ページとして扱われ、`ranges` / `step` / `overlap` でチャンク分割されます。
+- OpenAIの `detail="original"` は画像入力時のみ適用され、PDF入力では `input_file` として送信されます。
+- 処理は非同期ジョブとして実行されます（`/api/jobs`, `/api/jobs/{jobId}`）。
