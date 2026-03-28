@@ -268,6 +268,7 @@ func buildGeminiPrompt(frontPrompt, backPrompt string, task chunkTask) string {
 要件:
 - question(front): %s
 - answer(back): %s
+%s
 - 応答は配列(JSON)のみ
 - 各要素のキーは page, question, answer, confidence, issue
 - %s
@@ -277,6 +278,7 @@ func buildGeminiPrompt(frontPrompt, backPrompt string, task chunkTask) string {
 - チャンク内にQ/A化できる内容が無ければ [] を返す`,
 			frontPrompt,
 			backPrompt,
+			buildSourceNotationPromptText(),
 			pagePromptInstruction(task.Kind),
 			buildIssuePromptText(),
 		))
@@ -291,6 +293,7 @@ func buildGeminiPrompt(frontPrompt, backPrompt string, task chunkTask) string {
 要件:
 - question(front): %s
 - answer(back): %s
+%s
 - 応答は配列(JSON)のみ
 - 各要素のキーは page, question, answer, confidence, issue
 - %s
@@ -301,6 +304,7 @@ func buildGeminiPrompt(frontPrompt, backPrompt string, task chunkTask) string {
 		task.Range.Label(),
 		frontPrompt,
 		backPrompt,
+		buildSourceNotationPromptText(),
 		pagePromptInstruction(task.Kind),
 		buildIssuePromptText(),
 	))

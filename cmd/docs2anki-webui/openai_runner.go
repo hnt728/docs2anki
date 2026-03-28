@@ -231,6 +231,7 @@ func buildOpenAIPrompt(frontPrompt, backPrompt string, task chunkTask) string {
 要件:
 - question(front): %s
 - answer(back): %s
+%s
 - 最上位は JSON object
 - 最上位キーは cards のみ
 - cards はカード配列
@@ -243,6 +244,7 @@ func buildOpenAIPrompt(frontPrompt, backPrompt string, task chunkTask) string {
 - 配列単体は返さない`,
 			frontPrompt,
 			backPrompt,
+			buildSourceNotationPromptText(),
 			pagePromptInstruction(task.Kind),
 			buildIssuePromptText(),
 		))
@@ -257,6 +259,7 @@ func buildOpenAIPrompt(frontPrompt, backPrompt string, task chunkTask) string {
 要件:
 - question(front): %s
 - answer(back): %s
+%s
 - 最上位は JSON object
 - 最上位キーは cards のみ
 - cards はカード配列
@@ -270,6 +273,7 @@ func buildOpenAIPrompt(frontPrompt, backPrompt string, task chunkTask) string {
 		task.Range.Label(),
 		frontPrompt,
 		backPrompt,
+		buildSourceNotationPromptText(),
 		pagePromptInstruction(task.Kind),
 		buildIssuePromptText(),
 	))

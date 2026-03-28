@@ -192,6 +192,11 @@ func buildIssuePromptText() string {
 	return strings.TrimSpace(b.String())
 }
 
+func buildSourceNotationPromptText() string {
+	return strings.TrimSpace(`- front/back の指示で要約・抽象化・言い換えを明示的に求められている場合、またはカードとして成立させるための最小限の整形が必要な場合を除き、原則として原文の表記をそのまま使用する。
+- 特に、固有名詞・専門用語・略語・数値・単位・記号・式は原文の表記を維持し、不要な言い換えや表記変更をしない。`)
+}
+
 func pagePromptInstruction(kind sourceKind) string {
 	switch kind {
 	case sourceKindImage:
